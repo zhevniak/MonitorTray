@@ -2,9 +2,7 @@
 
 **Turn individual monitors on and off right from the Windows system tray — no DDC/CI required.**
 
-[Русская версия readme — здесь](README.ru.md)
-
-Do you have a second (or third) monitor that you only use sometimes, but it stays on and glows in the corner? MonitorTray adds a small icon to the system tray (much like [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray) does for brightness) where every monitor is one click away: click to turn it off, click again to turn it back on.
+Do you have a second (or third) monitor that you only use sometimes, but it stays on and glows in the corner? MonitorTray adds a small icon to the system tray where every monitor is one click away: click to turn it off, click again to turn it back on.
 
 It works with monitors that **don't support DDC/CI power control** — tools like ScreenOff (DDC "Power Control") fail on those, while MonitorTray uses the same mechanism as the built-in Windows *Settings → Display → "Disconnect this display"* (the Windows Display Config API / CCD). The monitor actually loses signal and goes to sleep, exactly as if you had unplugged the cable.
 
@@ -32,19 +30,21 @@ No admin rights required.
 Left-click (or right-click) the tray icon:
 
 ```
-Мониторы — вкл: 2
+Monitors — on: 2
 ──────────────────────────
-●  DELL S2721DGF  — основной      ← click to turn OFF
+●  DELL S2721DGF  — primary      ← click to turn OFF
 ●  Redmi 27 NQ                    ← click to turn OFF
 ──────────────────────────
-Погасить все экраны (до 1-го движения мыши)
+Put all screens to sleep (until first mouse move)
+Language  ▸  English / Русский
 ──────────────────────────
-Запускать при входе в Windows
-О программе
-Выход
+Start with Windows
+About
+Exit
 ```
 
 - `●` — monitor is on; `○` — monitor is off (shown in orange, click to turn back on)
+- English is the default language; switch to Russian from the **Language** menu item (the choice is remembered)
 - Turning off the primary monitor is supported: the remaining one becomes primary, and everything is restored when you turn it back on
 - Turning off the **last** active monitor is blocked on purpose (so you never end up with a black screen)
 
@@ -124,9 +124,8 @@ If your antivirus complains, you can: check the file on [VirusTotal](https://www
 
 ## License
 
-[MIT](LICENSE) — free for everyone. Inspired by the UX of [Twinkle Tray](https://github.com/xanderfrangos/twinkle-tray) (brightness) and the approach of NirSoft's MultiMonitorTool.
+[MIT](LICENSE) — free for everyone.
 
 ## Support
 
-Issues and PRs are welcome. Feedback in Russian is welcome too 🙂
-You can also ask questions in Russian — the author is a native speaker.
+Issues and PRs are welcome.
