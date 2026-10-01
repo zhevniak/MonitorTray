@@ -2,6 +2,8 @@
 
 **Turn individual monitors on and off right from the Windows system tray — no DDC/CI required.**
 
+![MonitorTray tray menu](screenshot.png)
+
 Do you have a second (or third) monitor that you only use sometimes, but it stays on and glows in the corner? MonitorTray adds a small icon to the system tray where every monitor is one click away: click to turn it off, click again to turn it back on.
 
 It works with monitors that **don't support DDC/CI power control** — tools like ScreenOff (DDC "Power Control") fail on those, while MonitorTray uses the same mechanism as the built-in Windows *Settings → Display → "Disconnect this display"* (the Windows Display Config API / CCD). The monitor actually loses signal and goes to sleep, exactly as if you had unplugged the cable.

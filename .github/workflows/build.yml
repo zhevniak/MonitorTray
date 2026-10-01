@@ -21,7 +21,7 @@ jobs:
 
       - name: Make portable zip
         shell: pwsh
-        run: Compress-Archive -Path MonitorTray.exe, README.md, LICENSE -DestinationPath MonitorTray-1.0-portable.zip
+        run: Compress-Archive -Path MonitorTray.exe, README.md, screenshot.png, LICENSE -DestinationPath MonitorTray-1.0-portable.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
