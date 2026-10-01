@@ -116,6 +116,17 @@ What we do about it:
 
 If your antivirus complains, you can: check the file on [VirusTotal](https://www.virustotal.com) and compare with the hashes published in the release notes, build the exe yourself from source with `build.cmd` (any Windows machine, no tools needed), or add an exclusion.
 
+### SmartScreen warning ("Windows protected your PC")
+
+When you run a freshly downloaded `MonitorTray.exe`, Windows SmartScreen may say *"unknown publisher"*. That is standard Windows behavior for **any** application that has no (expensive) code-signing certificate — it says nothing about this particular app. The binaries in Releases are built automatically from this very repository by GitHub Actions, so anyone can verify that nothing is added to them.
+
+Two ways to run it:
+
+- click **More info → Run anyway**, or
+- right-click the file → **Properties** → tick **Unblock** → **OK** — then it starts normally without any warning.
+
+A code-signing certificate for open-source developers is on the roadmap; it removes this warning completely.
+
 ## Troubleshooting
 
 - **A monitor didn't come back on** — run `MonitorTray restore`, or open *Settings → Display*, or replug the cable
