@@ -246,6 +246,50 @@ namespace MonitorTray
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
 
+        // ---- окна: запоминание/восстановление позиций при вкл/выкл мониторов ----
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct WINDOWPLACEMENT
+        {
+            public int length;
+            public int flags;
+            public int showCmd;            // 2 = свёрнуто, 3 = развёрнуто
+            public POINTL ptMinPosition;
+            public POINTL ptMaxPosition;
+            public RECT rcNormalPosition;
+        }
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int attrValue, int attrSize);
+
         public static int Query(uint flags, out DISPLAYCONFIG_PATH_INFO[] paths, out DISPLAYCONFIG_MODE_INFO[] modes)
         {
             paths = new DISPLAYCONFIG_PATH_INFO[0];
@@ -513,6 +557,15 @@ namespace MonitorTray
                 for (int i = 0; i < disabled.Count; i++)
                     disabled[i].GdiName = leftovers[i].Dev;
 
+            // выключенным мониторам, которых не нашли выше — GDI-имя из сохранённой карты
+            Dictionary<string, string> monMap = LoadMonMap();
+            foreach (Mon m2 in list)
+            {
+                if (m2.Active || m2.GdiName.Length > 0) continue;
+                string g;
+                if (monMap.TryGetValue(MapKey(m2), out g) && g.Length > 0) m2.GdiName = g;
+            }
+
             // Человеческие имена мониторов: реестр (EDID) либо DeviceString
             foreach (GdiEntry d in gdis)
             {
@@ -653,6 +706,8 @@ namespace MonitorTray
             LastError = "";
             if (!_probed) Probe();
             SaveCurrentMode(m); // запомнить текущий режим, чтобы вернуть его при включении
+            SaveMonMap(m);       // запомнить GDI-имя монитора (после выключения его сложно вычислить)
+            WinSnap.Snapshot(); // запомнить позиции окон, чтобы вернуть их при включении
             Native.DISPLAYCONFIG_PATH_INFO[] ap;
             Native.DISPLAYCONFIG_MODE_INFO[] am;
             int hr = QueryEx(Native.QDC_ONLY_ACTIVE_PATHS, out ap, out am);
@@ -694,6 +749,49 @@ namespace MonitorTray
             }
             if (hr != 0) LastError = "SetDisplayConfig: 0x" + hr.ToString("X");
             return hr;
+        }
+
+        // ---- соответствие монитор (adapter|target) -> GDI-имя, живёт в файле ----
+        static string MonMapFile()
+        {
+            return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "MonitorTray_monmap.txt");
+        }
+
+        static string MapKey(Mon m)
+        {
+            return m.AdapterId.LowPart + "|" + m.AdapterId.HighPart + "|" + m.TargetId;
+        }
+
+        static Dictionary<string, string> LoadMonMap()
+        {
+            Dictionary<string, string> map = new Dictionary<string, string>();
+            try
+            {
+                if (!System.IO.File.Exists(MonMapFile())) return map;
+                foreach (string line in System.IO.File.ReadAllLines(MonMapFile()))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    map[line.Substring(0, eq)] = line.Substring(eq + 1);
+                }
+            }
+            catch { }
+            return map;
+        }
+
+        static void SaveMonMap(Mon m)
+        {
+            try
+            {
+                if (m == null || m.GdiName == null || m.GdiName.Length == 0) return;
+                Dictionary<string, string> map = LoadMonMap();
+                map[MapKey(m)] = m.GdiName;
+                List<string> lines = new List<string>();
+                foreach (KeyValuePair<string, string> kv in map) lines.Add(kv.Key + "=" + kv.Value);
+                System.IO.File.WriteAllLines(MonMapFile(), lines.ToArray());
+            }
+            catch { }
         }
 
         static bool TargetNowActive(Mon m)
@@ -771,9 +869,32 @@ namespace MonitorTray
         public static int Enable(Mon m, bool verbose)
         {
             int hr = EnableInner(m, verbose);
-            if (hr == 0) RestoreSavedMode(m);
+            if (hr == 0)
+            {
+                RestoreSavedMode(m);
+                // окна вернуть на вернувшийся монитор — после того как рабочий стол перестроится
+                string gdi = m.GdiName;
+                if (GuiMode)
+                {
+                    Thread t = new Thread(delegate()
+                    {
+                        try { Thread.Sleep(1500); WinSnap.RestoreFor(gdi, verbose); }
+                        catch { }
+                    });
+                    t.IsBackground = true;
+                    t.Start();
+                }
+                else
+                {
+                    // в консольном режиме процесс живёт недолго — восстанавливаем сразу
+                    try { Thread.Sleep(1500); WinSnap.RestoreFor(gdi, verbose); }
+                    catch { }
+                }
+            }
             return hr;
         }
+
+        public static bool GuiMode; // выставляется Program.Main перед запуском трея
 
         static int EnableInner(Mon m, bool verbose)
         {
@@ -925,6 +1046,178 @@ namespace MonitorTray
                 Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
             int r2 = Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
             return r1 != 0 ? r1 : r2;
+        }
+    }
+
+    // ------------------------------------------------- окна: запоминание позиций
+    // Перед выключением монитора снимаем позиции всех обычных окон,
+    // после включения возвращаем окна, жившие на вернувшемся мониторе.
+    internal static class WinSnap
+    {
+        class SnapWin
+        {
+            public IntPtr Hwnd;
+            public Native.WINDOWPLACEMENT Pl;
+            public string Gdi;
+        }
+
+        static readonly List<SnapWin> _saved = new List<SnapWin>();
+
+        // снимок храним и в памяти, и в файле: файл переживает перезапуск
+        // программы и работает между отдельными консольными командами
+        static string SnapFile()
+        {
+            return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "MonitorTray_windows.txt");
+        }
+
+        static void SaveFile()
+        {
+            try
+            {
+                List<string> lines = new List<string>();
+                foreach (SnapWin w in _saved)
+                {
+                    Native.RECT r = w.Pl.rcNormalPosition;
+                    lines.Add(w.Hwnd.ToInt64() + "|" + w.Gdi + "|" + w.Pl.showCmd +
+                        "|" + r.Left + "|" + r.Top + "|" + r.Right + "|" + r.Bottom);
+                }
+                System.IO.File.WriteAllLines(SnapFile(), lines.ToArray());
+            }
+            catch { }
+        }
+
+        static void LoadFileIfEmpty()
+        {
+            if (_saved.Count > 0) return;
+            try
+            {
+                if (!System.IO.File.Exists(SnapFile())) return;
+                foreach (string line in System.IO.File.ReadAllLines(SnapFile()))
+                {
+                    string[] p = line.Split('|');
+                    if (p.Length < 7) continue;
+                    SnapWin w = new SnapWin();
+                    w.Hwnd = new IntPtr(long.Parse(p[0]));
+                    w.Gdi = p[1];
+                    w.Pl = new Native.WINDOWPLACEMENT();
+                    w.Pl.showCmd = int.Parse(p[2]);
+                    w.Pl.rcNormalPosition = new Native.RECT();
+                    w.Pl.rcNormalPosition.Left = int.Parse(p[3]);
+                    w.Pl.rcNormalPosition.Top = int.Parse(p[4]);
+                    w.Pl.rcNormalPosition.Right = int.Parse(p[5]);
+                    w.Pl.rcNormalPosition.Bottom = int.Parse(p[6]);
+                    _saved.Add(w);
+                }
+            }
+            catch { }
+        }
+
+        public static void Snapshot()
+        {
+            lock (_saved)
+            {
+                _saved.Clear();
+                Native.EnumWindows(delegate(IntPtr h, IntPtr lp)
+                {
+                    try
+                    {
+                        if (!Native.IsWindowVisible(h)) return true;
+                        if (Native.GetWindowTextLength(h) == 0) return true; // безымянные/служебные
+                        uint ex = Native.GetWindowLong(h, -20 /*GWL_EXSTYLE*/);
+                        if ((ex & 0x80) != 0) return true; // WS_EX_TOOLWINDOW
+                        int cloaked;
+                        if (Native.DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, out cloaked, 4) == 0 && cloaked != 0)
+                            return true; // скрытые UWP
+                        Native.WINDOWPLACEMENT pl = new Native.WINDOWPLACEMENT();
+                        pl.length = System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.WINDOWPLACEMENT));
+                        if (!Native.GetWindowPlacement(h, ref pl)) return true;
+                        Native.RECT r = pl.rcNormalPosition;
+                        if (r.Right - r.Left <= 0 || r.Bottom - r.Top <= 0) return true;
+                        int cx = (r.Left + r.Right) / 2;
+                        int cy = (r.Top + r.Bottom) / 2;
+                        string gdi = null;
+                        foreach (Screen s in Screen.AllScreens)
+                            if (s.Bounds.Contains(cx, cy)) { gdi = s.DeviceName; break; }
+                        if (gdi == null) return true;
+                        SnapWin w = new SnapWin();
+                        w.Hwnd = h; w.Pl = pl; w.Gdi = gdi;
+                        _saved.Add(w);
+                    }
+                    catch { }
+                    return true;
+                }, IntPtr.Zero);
+                SaveFile();
+            }
+        }
+
+        // отладка: что сейчас в снимке
+        public static string Dump()
+        {
+            lock (_saved)
+            {
+                System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                sb.Append("winsnap count=").Append(_saved.Count).AppendLine();
+                foreach (SnapWin w in _saved)
+                    sb.Append("  hwnd=").Append(w.Hwnd).Append(" gdi=").Append(w.Gdi)
+                      .Append(" rc=").Append(w.Pl.rcNormalPosition.Left).Append(",").Append(w.Pl.rcNormalPosition.Top)
+                      .Append(" showCmd=").Append(w.Pl.showCmd).AppendLine();
+                return sb.ToString();
+            }
+        }
+
+        // вернуть окна, которые жили на мониторе gdiName
+        public static void RestoreFor(string gdiName, bool verbose)
+        {
+            if (gdiName == null || gdiName.Length == 0) return;
+            lock (_saved)
+            {
+                LoadFileIfEmpty();
+                if (verbose) Console.Error.WriteLine("  [winsnap] restore for " + gdiName + ", entries=" + _saved.Count);
+                foreach (SnapWin w in _saved)
+                {
+                    try
+                    {
+                        if (w.Gdi != gdiName) continue;
+                        if (!Native.IsWindow(w.Hwnd))
+                        {
+                            if (verbose) Console.Error.WriteLine("  [winsnap] hwnd " + w.Hwnd + " closed");
+                            continue;
+                        }
+                        Native.WINDOWPLACEMENT cur = new Native.WINDOWPLACEMENT();
+                        cur.length = System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.WINDOWPLACEMENT));
+                        if (!Native.GetWindowPlacement(w.Hwnd, ref cur)) continue;
+                        Native.RECT a = cur.rcNormalPosition, b = w.Pl.rcNormalPosition;
+                        if (a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom
+                            && cur.showCmd == w.Pl.showCmd)
+                        {
+                            if (verbose) Console.Error.WriteLine("  [winsnap] hwnd " + w.Hwnd + " already in place");
+                            continue;
+                        }
+                        Native.WINDOWPLACEMENT np = w.Pl;
+                        np.length = System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.WINDOWPLACEMENT));
+                        if (w.Pl.showCmd == 3)
+                        {
+                            // развёрнутое: сначала нормальное состояние в сохранённой позиции…
+                            np.showCmd = 1;
+                            Native.SetWindowPlacement(w.Hwnd, ref np);
+                            // …потом разворот заново — уже на нужном мониторе
+                            Native.ShowWindow(w.Hwnd, 3);
+                        }
+                        else
+                        {
+                            // нормальное или свёрнутое: позиция применяется как есть
+                            bool ok = Native.SetWindowPlacement(w.Hwnd, ref np);
+                            if (verbose) Console.Error.WriteLine("  [winsnap] hwnd " + w.Hwnd + " -> " +
+                                b.Left + "," + b.Top + " SetWindowPlacement=" + ok);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (verbose) Console.Error.WriteLine("  [winsnap] error: " + ex.Message);
+                    }
+                }
+            }
         }
     }
 
@@ -1274,6 +1567,8 @@ namespace MonitorTray
 
             if (cmd == "dbg")
             {
+                WinSnap.Snapshot();
+                Console.Write(WinSnap.Dump());
                 Console.WriteLine("sizeof PATH_INFO = " + Marshal.SizeOf(typeof(Native.DISPLAYCONFIG_PATH_INFO)) +
                     "  MODE_INFO = " + Marshal.SizeOf(typeof(Native.DISPLAYCONFIG_MODE_INFO)));
                 Console.WriteLine("virtual=" + Svc.IsVirtual);
@@ -1375,6 +1670,7 @@ namespace MonitorTray
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             try { Native.SetProcessDPIAware(); } catch { }
+            Svc.GuiMode = true;
             Application.Run(new TrayApp());
             GC.KeepAlive(mtx);
         }

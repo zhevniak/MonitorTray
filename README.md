@@ -12,6 +12,7 @@ It works with monitors that **don't support DDC/CI power control** — tools lik
 
 - 🖥 **Per-monitor power control from the tray** — left- or right-click the icon, then click a monitor to toggle it
 - 🔌 **No DDC/CI needed** — uses the Windows Display Config API, works on monitors where DDC tools give up
+- 🪟 **Puts your windows back** — when a monitor is turned on again, the windows that lived on it (Windows moves them away when it turns off) return to their places, including maximized/minimized ones
 - 📏 **Remembers resolution & refresh rate** — when a monitor is turned back on, its previous mode (e.g. a custom 1600×1024@165) is restored automatically instead of jumping to the native default
 - 🌙 **"Put all screens to sleep"** — one menu item sends all monitors to DPMS sleep (they wake on any input)
 - 🚀 **Startup entry** — optional autostart, straight from the tray menu

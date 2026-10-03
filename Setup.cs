@@ -19,8 +19,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace MonitorTraySetup
 {
@@ -83,7 +83,7 @@ namespace MonitorTraySetup
                 @"Software\Microsoft\Windows\CurrentVersion\Uninstall\MonitorTray"))
             {
                 k.SetValue("DisplayName", "MonitorTray");
-                k.SetValue("DisplayVersion", "1.0");
+                k.SetValue("DisplayVersion", "1.1");
                 k.SetValue("DisplayIcon", exe);
                 k.SetValue("UninstallString", Path.Combine(dir, "Uninstall.exe"));
                 k.SetValue("InstallLocation", dir);
