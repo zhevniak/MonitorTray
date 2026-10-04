@@ -31,8 +31,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
 
 namespace MonitorTray
 {
@@ -128,12 +128,13 @@ namespace MonitorTray
         public struct DISPLAYCONFIG_TARGET_NAME
         {
             public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
-            public uint outputTechnology;
+            public uint flags;
+            public uint outputTechnology;   // 5 — HDMI, 10 — DisplayPort, 4 — DVI, 0 — VGA …
             public ushort edidManufactureId;
             public ushort edidProductCodeId;
             public uint connectorInstance;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -321,6 +322,18 @@ namespace MonitorTray
         public static extern bool SetMonitorBrightness(IntPtr hMonitor, uint dwNewBrightness);
 
         [DllImport("dxva2.dll")]
+        public static extern bool GetCapabilitiesStringLength(IntPtr hMonitor, out uint pdwCapabilitiesStringLengthInCharacters);
+
+        [DllImport("dxva2.dll", CharSet = CharSet.Ansi)]
+        public static extern bool CapabilitiesRequestAndCapabilitiesReply(IntPtr hMonitor, StringBuilder pszASCIICapabilitiesString, uint dwCapabilitiesStringLengthInCharacters);
+
+        [DllImport("dxva2.dll")]
+        public static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr hMonitor, byte bVCPCode, IntPtr pvct, out uint pdwCurrentValue, out uint pdwMaximumValue);
+
+        [DllImport("dxva2.dll")]
+        public static extern bool SetVCPFeature(IntPtr hMonitor, byte bVCPCode, uint dwNewValue);
+
+        [DllImport("dxva2.dll")]
         public static extern bool DestroyPhysicalMonitor(IntPtr hMonitor);
 
         public static int Query(uint flags, out DISPLAYCONFIG_PATH_INFO[] paths, out DISPLAYCONFIG_MODE_INFO[] modes)
@@ -367,6 +380,7 @@ namespace MonitorTray
         public uint SourceId;
         public string Name = "";
         public string DevicePath = "";
+        public uint Connection = 0xFFFFFFFF;   // outputTechnology: 5 — HDMI, 10 — DisplayPort …
         public string GdiName = "";
         public bool Active;
         public bool Primary;
@@ -420,9 +434,10 @@ namespace MonitorTray
             return SameLuid(p.targetInfo.adapterId, m.AdapterId) && p.targetInfo.id == m.TargetId;
         }
 
-        static string GetTargetName(Native.LUID adapter, uint targetId, out string devicePath)
+        static string GetTargetName(Native.LUID adapter, uint targetId, out string devicePath, out uint tech)
         {
             devicePath = null;
+            tech = 0xFFFFFFFF;
             try
             {
                 Native.DISPLAYCONFIG_TARGET_NAME tn = new Native.DISPLAYCONFIG_TARGET_NAME();
@@ -432,6 +447,7 @@ namespace MonitorTray
                 tn.header.id = targetId;
                 if (Native.DisplayConfigGetDeviceInfo(ref tn) != 0) return null;
                 devicePath = tn.monitorDevicePath;
+                tech = tn.outputTechnology;
                 string n = tn.monitorFriendlyDeviceName;
                 if (n != null) n = n.Trim();
                 return n;
@@ -516,7 +532,7 @@ namespace MonitorTray
                 m.SourceId = p.sourceInfo.id;
                 m.Active = true;
                 string path;
-                m.Name = GetTargetName(m.AdapterId, m.TargetId, out path);
+                m.Name = GetTargetName(m.AdapterId, m.TargetId, out path, out m.Connection);
                 m.DevicePath = path != null ? path : "";
                 m.GdiName = GetSourceName(p.sourceInfo.adapterId, p.sourceInfo.id);
                 if (m.GdiName == null) m.GdiName = "";
@@ -552,7 +568,7 @@ namespace MonitorTray
                     m.SourceId = p.sourceInfo.id;
                     m.Active = false;
                     string path;
-                    m.Name = GetTargetName(m.AdapterId, m.TargetId, out path);
+                    m.Name = GetTargetName(m.AdapterId, m.TargetId, out path, out m.Connection);
                     m.DevicePath = path != null ? path : "";
                     m.GdiName = GetSourceName(p.sourceInfo.adapterId, p.sourceInfo.id);
                     if (m.GdiName == null) m.GdiName = "";
@@ -717,14 +733,15 @@ namespace MonitorTray
         static int TrySet(Native.DISPLAYCONFIG_PATH_INFO[] paths, Native.DISPLAYCONFIG_MODE_INFO[] modes, bool verbose)
         {
             uint vf = _virtual ? Native.SDC_VIRTUAL_MODE_AWARE : 0;
-            // Комбинации с SDC_NO_OPTIMIZATION идут первыми: Windows вносит
-            // минимальные изменения и не пере-применяет нетронутые выходы,
-            // поэтому оставшийся монитор не мигает.
+            // Сначала обычное применение: Windows меняет только то, что изменилось.
+            // SDC_NO_OPTIMIZATION заставляет заново применить режим на КАЖДОМ мониторе —
+            // остальные экраны мигают, поэтому он только в самом конце, как запасной вариант.
             uint[] flagSets = new uint[] {
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | vf,
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_ALLOW_PATH_ORDER_CHANGES | vf,
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_SAVE_TO_DATABASE | vf,
                 Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_NO_OPTIMIZATION | Native.SDC_ALLOW_PATH_ORDER_CHANGES | vf,
                 Native.SDC_APPLY | Native.SDC_NO_OPTIMIZATION | Native.SDC_ALLOW_PATH_ORDER_CHANGES | vf,
-                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | vf,
-                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_SAVE_TO_DATABASE | vf,
                 Native.SDC_APPLY | Native.SDC_NO_OPTIMIZATION | vf
             };
             int hr = -1;
@@ -734,6 +751,42 @@ namespace MonitorTray
                 if (verbose) Console.Error.WriteLine("  SetDisplayConfig(flags=0x" + f.ToString("X") + ") -> 0x" + hr.ToString("X"));
                 if (hr == 0) return 0;
             }
+            return hr;
+        }
+
+        // Сделать монитор основным — как «Сделать основным дисплеем» в параметрах Windows:
+        // рабочий стол сдвигается так, чтобы выбранный монитор встал в (0,0).
+        // Раскладка SOURCE-режима: u0=размер, u1.lo=формат пикселей, u1.hi=x, u2.lo=y.
+        public static int SetPrimary(Mon m, bool verbose)
+        {
+            LastError = "";
+            if (!_probed) Probe();
+            Native.DISPLAYCONFIG_PATH_INFO[] ap;
+            Native.DISPLAYCONFIG_MODE_INFO[] am;
+            int hr = QueryEx(Native.QDC_ONLY_ACTIVE_PATHS, out ap, out am);
+            if (hr != 0) { LastError = "QueryDisplayConfig: 0x" + hr.ToString("X"); return hr; }
+            int idx = -1;
+            for (int i = 0; i < ap.Length; i++) if (SameTarget(ap[i], m)) idx = i;
+            if (idx < 0) { LastError = "монитор выключен"; return -1; }
+            uint sidx = _virtual ? (ap[idx].sourceInfo.modeInfoIdx & 0xFFFF) : ap[idx].sourceInfo.modeInfoIdx;
+            if (sidx == Native.MODE_IDX_INVALID || sidx >= am.Length || am[sidx].infoType != 1)
+            { LastError = "нет режима источника"; return -1; }
+            int x0 = (int)(am[sidx].u1 >> 32), y0 = (int)(am[sidx].u2 & 0xFFFFFFFF);
+            if (x0 == 0 && y0 == 0) return 0; // уже основной
+            for (int i = 0; i < am.Length; i++)
+            {
+                if (am[i].infoType != 1) continue;
+                int x = (int)(am[i].u1 >> 32) - x0, y = (int)(am[i].u2 & 0xFFFFFFFF) - y0;
+                am[i].u1 = (am[i].u1 & 0xFFFFFFFF) | ((ulong)(uint)x << 32);
+                am[i].u2 = (am[i].u2 & 0xFFFFFFFF00000000) | (uint)y;
+            }
+            uint vf = _virtual ? Native.SDC_VIRTUAL_MODE_AWARE : 0;
+            // с сохранением в базу Windows — чтобы основной монитор остался и после перезагрузки
+            hr = Native.SetDisplayConfig((uint)ap.Length, ap, (uint)am.Length, am,
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_SAVE_TO_DATABASE | vf);
+            if (verbose) Console.Error.WriteLine("  SetDisplayConfig(primary, save) -> 0x" + hr.ToString("X"));
+            if (hr != 0) hr = TrySet(ap, am, verbose);
+            if (hr != 0) LastError = "SetDisplayConfig: 0x" + hr.ToString("X");
             return hr;
         }
 
@@ -997,8 +1050,11 @@ namespace MonitorTray
             foreach (Native.DISPLAYCONFIG_PATH_INFO p in ap)
                 if (SameTarget(p, m)) { if (verbose) Console.Error.WriteLine("  already active"); return 0; }
 
+            // на этом мониторе уже срабатывал «свежий источник» — старый способ не пробуем
+            bool freshFirst = FreshKnown(m);
+
             // 1) Самый надёжный способ — подключить через ChangeDisplaySettingsEx
-            if (m.GdiName != null && m.GdiName.Length > 0)
+            if (!freshFirst && m.GdiName != null && m.GdiName.Length > 0)
             {
                 int hrC = EnableCds(m.GdiName);
                 if (verbose) Console.Error.WriteLine("  EnableCds -> 0x" + hrC.ToString("X"));
@@ -1031,6 +1087,9 @@ namespace MonitorTray
             }
             cands.AddRange(cands2);
             if (cands.Count == 0) { LastError = "путь монитора не найден"; return -1; }
+
+            // сразу способом, который сработал в прошлый раз: одна перестройка экранов вместо нескольких
+            if (freshFirst && EnableFresh(m, ap, am, allp, cands, verbose) == 0) return 0;
 
             hr = -1;
             foreach (int ci in cands)
@@ -1118,49 +1177,11 @@ namespace MonitorTray
                 if (hr == 0 && TargetNowActive(m)) return 0;
             }
 
-            // Последний шанс: новые драйверы NVIDIA не сохраняют режимы выключенного
-            // монитора и игнорируют пути с переиспользованными источниками. Помогает
-            // путь со СВЕЖИМ source-id и полностью синтезированными режимами
-            // (проверено на Win10 22H2 + драйвер NVIDIA 580.x).
-            if (!TargetNowActive(m))
+            // Последний шанс — «свежий источник» (новые драйверы NVIDIA); сработал — запомнить
+            if (!freshFirst && !TargetNowActive(m) && EnableFresh(m, ap, am, allp, cands, verbose) == 0)
             {
-                uint sw2, sh2, sf2;
-                GetSavedModeSize(m.GdiName, out sw2, out sh2, out sf2);
-                System.Drawing.Rectangle vs1 = SystemInformation.VirtualScreen;
-                foreach (int ci in cands)
-                {
-                    Native.DISPLAYCONFIG_PATH_INFO base1 = allp[ci];
-
-                    Native.DISPLAYCONFIG_PATH_INFO np2 = new Native.DISPLAYCONFIG_PATH_INFO();
-                    np2.sourceInfo.adapterId = base1.targetInfo.adapterId;
-                    np2.sourceInfo.id = base1.targetInfo.id; // свежий id источника
-                    np2.targetInfo = base1.targetInfo;
-                    np2.targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
-                    np2.flags = 1;
-
-                    Native.DISPLAYCONFIG_PATH_INFO[] mergedP2 = new Native.DISPLAYCONFIG_PATH_INFO[ap.Length + 1];
-                    Array.Copy(ap, mergedP2, ap.Length);
-                    Native.DISPLAYCONFIG_MODE_INFO[] mergedM2 = new Native.DISPLAYCONFIG_MODE_INFO[am.Length + 2];
-                    Array.Copy(am, mergedM2, am.Length);
-                    mergedM2[am.Length] = MakeSourceMode(np2.sourceInfo.id, np2.sourceInfo.adapterId, sw2, sh2, vs1.Right, 0);
-                    mergedM2[am.Length + 1] = MakeTargetMode(np2.targetInfo.id, np2.targetInfo.adapterId, sw2, sh2, sf2);
-                    uint base2 = (uint)am.Length;
-                    if (_virtual)
-                    {
-                        np2.sourceInfo.modeInfoIdx = base2;
-                        np2.targetInfo.modeInfoIdx = ((0xFFFFu) << 16) | (base2 + 1);
-                    }
-                    else
-                    {
-                        np2.sourceInfo.modeInfoIdx = base2;
-                        np2.targetInfo.modeInfoIdx = base2 + 1;
-                    }
-                    mergedP2[ap.Length] = np2;
-
-                    if (verbose) Console.Error.WriteLine("  [enable] trying fresh-source fallback…");
-                    hr = TrySet(mergedP2, mergedM2, verbose);
-                    if (hr == 0 && TargetNowActive(m)) return 0;
-                }
+                RememberFresh(m);
+                return 0;
             }
 
             if (!TargetNowActive(m))
@@ -1171,6 +1192,74 @@ namespace MonitorTray
                 return -1;
             }
             return 0;
+        }
+
+        // Новые драйверы NVIDIA не сохраняют режимы выключенного монитора и игнорируют пути
+        // с переиспользованными источниками. Помогает путь со СВЕЖИМ source-id и полностью
+        // синтезированными режимами (проверено на Win10 22H2 + драйвер NVIDIA 580.x).
+        static int EnableFresh(Mon m, Native.DISPLAYCONFIG_PATH_INFO[] ap, Native.DISPLAYCONFIG_MODE_INFO[] am,
+            Native.DISPLAYCONFIG_PATH_INFO[] allp, List<int> cands, bool verbose)
+        {
+            uint sw2, sh2, sf2;
+            GetSavedModeSize(m.GdiName, out sw2, out sh2, out sf2);
+            System.Drawing.Rectangle vs1 = SystemInformation.VirtualScreen;
+            foreach (int ci in cands)
+            {
+                Native.DISPLAYCONFIG_PATH_INFO base1 = allp[ci];
+
+                Native.DISPLAYCONFIG_PATH_INFO np2 = new Native.DISPLAYCONFIG_PATH_INFO();
+                np2.sourceInfo.adapterId = base1.targetInfo.adapterId;
+                np2.sourceInfo.id = base1.targetInfo.id; // свежий id источника
+                np2.targetInfo = base1.targetInfo;
+                np2.targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
+                np2.flags = 1;
+
+                Native.DISPLAYCONFIG_PATH_INFO[] mergedP2 = new Native.DISPLAYCONFIG_PATH_INFO[ap.Length + 1];
+                Array.Copy(ap, mergedP2, ap.Length);
+                Native.DISPLAYCONFIG_MODE_INFO[] mergedM2 = new Native.DISPLAYCONFIG_MODE_INFO[am.Length + 2];
+                Array.Copy(am, mergedM2, am.Length);
+                mergedM2[am.Length] = MakeSourceMode(np2.sourceInfo.id, np2.sourceInfo.adapterId, sw2, sh2, vs1.Right, 0);
+                mergedM2[am.Length + 1] = MakeTargetMode(np2.targetInfo.id, np2.targetInfo.adapterId, sw2, sh2, sf2);
+                uint base2 = (uint)am.Length;
+                if (_virtual)
+                {
+                    np2.sourceInfo.modeInfoIdx = base2;
+                    np2.targetInfo.modeInfoIdx = ((0xFFFFu) << 16) | (base2 + 1);
+                }
+                else
+                {
+                    np2.sourceInfo.modeInfoIdx = base2;
+                    np2.targetInfo.modeInfoIdx = base2 + 1;
+                }
+                mergedP2[ap.Length] = np2;
+
+                if (verbose) Console.Error.WriteLine("  [enable] trying fresh-source…");
+                int hr = TrySet(mergedP2, mergedM2, verbose);
+                if (hr == 0 && TargetNowActive(m)) return 0;
+            }
+            return -1;
+        }
+
+        // запомненный способ включения — в той же карте, что и GDI-имена (ключ — путь устройства)
+        static string FreshKey(Mon m) { return "fresh|" + (m.DevicePath.Length > 0 ? m.DevicePath : MapKey(m)); }
+
+        static bool FreshKnown(Mon m)
+        {
+            string v;
+            return LoadMonMap().TryGetValue(FreshKey(m), out v) && v == "1";
+        }
+
+        static void RememberFresh(Mon m)
+        {
+            try
+            {
+                Dictionary<string, string> map = LoadMonMap();
+                map[FreshKey(m)] = "1";
+                List<string> lines = new List<string>();
+                foreach (KeyValuePair<string, string> kv in map) lines.Add(kv.Key + "=" + kv.Value);
+                System.IO.File.WriteAllLines(MonMapFile(), lines.ToArray());
+            }
+            catch { }
         }
 
         public static int RestoreAll()
@@ -1397,6 +1486,7 @@ namespace MonitorTray
     {
         public IntPtr Handle;
         public string Gdi;
+        public string Wmi;           // встроенный экран ноутбука: экземпляр WMI (DDC у него нет)
         public uint Min, Cur, Max;   // сырой диапазон DDC
         public int? Pending;         // 0..100, применить отложенно
         public int Value;            // 0..100, что показывает ползунок
@@ -1433,7 +1523,70 @@ namespace MonitorTray
                     }
                 }
             }
+            AddLaptopPanels(res);
             return res;
+        }
+
+        // Встроенный экран ноутбука: яркость через WMI (WmiMonitorBrightness) — так же, как ползунок
+        // яркости Windows. На настольных ПК этого класса нет, и ничего не добавляется.
+        static void AddLaptopPanels(List<BrightEntry> res)
+        {
+            List<string[]> found = new List<string[]>(); // [экземпляр WMI, текущая яркость]
+            try
+            {
+                using (ManagementObjectSearcher q = new ManagementObjectSearcher(@"root\WMI",
+                    "SELECT InstanceName, CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE"))
+                    foreach (ManagementObject o in q.Get())
+                        found.Add(new string[] { Convert.ToString(o["InstanceName"]), Convert.ToString(o["CurrentBrightness"]) });
+            }
+            catch { return; }
+            if (found.Count == 0) return;
+            List<Mon> mons = Svc.List();
+            foreach (string[] f in found)
+            {
+                string gdi = GdiForWmi(f[0], mons, found.Count);
+                if (gdi == null || res.Exists(x => x.Gdi == gdi)) continue;
+                BrightEntry e = new BrightEntry();
+                e.Wmi = f[0]; e.Gdi = gdi; e.Min = 0; e.Max = 100;
+                uint cur;
+                e.Cur = uint.TryParse(f[1], out cur) ? Math.Min(cur, 100u) : 100u;
+                res.Add(e);
+            }
+        }
+
+        // экземпляр WMI «DISPLAY\BOE0812\4&1a2b&0&UID265988_0» ↔ путь монитора
+        // «\\?\DISPLAY#BOE0812#4&1a2b&0&UID265988#{e6f07b5f-…}»
+        internal static string GdiForWmi(string instance, List<Mon> mons, int wmiCount)
+        {
+            string inst = Regex.Replace(instance ?? "", @"_\d+$", "");
+            foreach (Mon m in mons)
+            {
+                if (!m.Active || m.DevicePath.Length == 0) continue;
+                string[] p = m.DevicePath.Split('#');
+                if (p.Length >= 3 && string.Equals("DISPLAY\\" + p[1] + "\\" + p[2], inst, StringComparison.OrdinalIgnoreCase))
+                    return m.GdiName;
+            }
+            // не сопоставилось по пути — единственный экран в WMI и единственный встроенный монитор
+            if (wmiCount == 1)
+            {
+                Mon only = null;
+                int n = 0;
+                foreach (Mon m in mons) if (m.Active && IsInternal(m.Connection)) { only = m; n++; }
+                if (n == 1) return only.GdiName;
+            }
+            return null;
+        }
+
+        // встроенная панель: «внутреннее» подключение, LVDS, встроенный DisplayPort или UDI
+        static bool IsInternal(uint tech) { return tech == 0x80000000 || tech == 6 || tech == 11 || tech == 13; }
+
+        static void SetWmi(string instance, int percent)
+        {
+            string esc = instance.Replace("\\", "\\\\").Replace("'", "\\'");
+            using (ManagementObjectSearcher q = new ManagementObjectSearcher(@"root\WMI",
+                "SELECT * FROM WmiMonitorBrightnessMethods WHERE InstanceName = '" + esc + "'"))
+                foreach (ManagementObject o in q.Get())
+                    o.InvokeMethod("WmiSetBrightness", new object[] { (uint)1, (byte)Math.Max(0, Math.Min(100, percent)) });
         }
 
         public static void Close(List<BrightEntry> list)
@@ -1441,6 +1594,7 @@ namespace MonitorTray
             if (list == null) return;
             foreach (BrightEntry e in list)
             {
+                if (e.Wmi != null) continue; // экран ноутбука — закрывать нечего
                 try { Native.DestroyPhysicalMonitor(e.Handle); } catch { }
             }
         }
@@ -1454,6 +1608,12 @@ namespace MonitorTray
         {
             try
             {
+                if (e.Wmi != null)
+                {
+                    SetWmi(e.Wmi, percent);
+                    e.Cur = (uint)Math.Max(0, Math.Min(100, percent));
+                    return;
+                }
                 uint v = e.Min + (uint)((e.Max - e.Min) * percent / 100);
                 Native.SetMonitorBrightness(e.Handle, v);
                 e.Cur = v;
@@ -1624,6 +1784,18 @@ namespace MonitorTray
                 case "afk_min": return ru ? "мин" : "min";
                 case "afk_hour": return ru ? "ч" : "h";
                 case "badge_afk": return "AFK";
+                case "badge_sleep": return ru ? "Сон" : "Sleep";
+                case "make_primary": return ru ? "Сделать основным" : "Make primary";
+                case "primary_done": return ru ? "{0} — теперь основной монитор" : "{0} is now the primary monitor";
+                case "inputs_title": return ru ? "Входы мониторов" : "Monitor inputs";
+                case "inputs_sub": return ru ? "Переключение HDMI / DP" : "Switch between HDMI / DP";
+                case "inputs_hint": return ru ? "Отметьте входы других устройств" : "Mark the inputs used by other devices";
+                case "this_pc": return ru ? "этот ПК" : "this PC";
+                case "input_n": return ru ? "Вход {0}" : "Input {0}";
+                case "last_monitor": return ru ? "это последний включённый монитор" : "it is the last monitor that is on";
+                case "afk_off_hint_ddc": return ru
+                    ? "{0} уснул: курсор давно не заходил на него. Чтобы разбудить, просто наведите на него курсор."
+                    : "{0} went to sleep: the cursor hasn't been there for a while. To wake it, just move the cursor onto it.";
                 case "afk_off_hint": return ru
                     ? "{0} выключен: курсор давно не заходил на него. Чтобы включить, толкните мышь в край экрана в его сторону или нажмите на него в окне MonitorTray."
                     : "{0} was turned off: the cursor hasn't been there for a while. To turn it back on, push the mouse against the screen edge on its side or click it in the MonitorTray window.";
@@ -1649,8 +1821,8 @@ namespace MonitorTray
                     ? "MonitorTray уже запущен — значок есть в области уведомлений (возможно, под стрелкой «^»)."
                     : "MonitorTray is already running — the icon is in the notification area (possibly under the \"^\" arrow).";
                 case "about_text": return ru
-                    ? "MonitorTray 1.3\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
-                    : "MonitorTray 1.3\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
+                    ? "MonitorTray 1.4\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
+                    : "MonitorTray 1.4\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
                 default: return key;
             }
         }
@@ -1763,6 +1935,31 @@ namespace MonitorTray
         public static bool AutoUpdate = true;
         // монитор → участвует ли в AFK-режиме (кого нет в списке: все, кроме основного)
         public static Dictionary<string, bool> AfkMonitors = new Dictionary<string, bool>();
+        // монитор → умеет ли спать по команде DDC/CI (узнаётся один раз)
+        public static Dictionary<string, bool> SleepCaps = new Dictionary<string, bool>();
+        // монитор → его входы (коды команды 60 через запятую) и входы, отмеченные для переключателя
+        public static Dictionary<string, string> InputCaps = new Dictionary<string, string>();
+        public static Dictionary<string, string> InputShow = new Dictionary<string, string>();
+
+        public static List<int> Codes(Dictionary<string, string> d, string key)
+        {
+            List<int> list = new List<int>();
+            string v;
+            if (d.TryGetValue(key, out v))
+                foreach (string c in v.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    int code;
+                    if (int.TryParse(c, System.Globalization.NumberStyles.HexNumber, null, out code)) list.Add(code);
+                }
+            return list;
+        }
+
+        public static string CodesToString(List<int> list)
+        {
+            List<string> parts = new List<string>();
+            foreach (int c in list) parts.Add(c.ToString("X2"));
+            return string.Join(",", parts.ToArray());
+        }
 
         // постоянный ключ монитора (путь устройства не меняется между перезагрузками)
         public static string MonKey(Mon m) { return m.DevicePath.Length > 0 ? m.DevicePath : m.Name; }
@@ -1770,7 +1967,9 @@ namespace MonitorTray
         public static bool AfkIncluded(Mon m)
         {
             bool v;
-            return AfkMonitors.TryGetValue(MonKey(m), out v) ? v : !m.Primary;
+            if (AfkMonitors.TryGetValue(MonKey(m), out v)) return v;
+            if (AfkMonitors.TryGetValue(m.Name, out v)) return v; // сохранено версией 1.3 (по имени)
+            return !m.Primary;
         }
 
         static string UiFile()
@@ -1797,6 +1996,12 @@ namespace MonitorTray
                         else if (line == "afk_hint=1") AfkHintShown = true;
                         else if (line == "update=1") AutoUpdate = true;
                         else if (line == "update=0") AutoUpdate = false;
+                        else if (line.StartsWith("input_cap=") && line.IndexOf('|') > 0)
+                            InputCaps[line.Substring(line.IndexOf('|') + 1)] = line.Substring(10, line.IndexOf('|') - 10);
+                        else if (line.StartsWith("input_show=") && line.IndexOf('|') > 0)
+                            InputShow[line.Substring(line.IndexOf('|') + 1)] = line.Substring(11, line.IndexOf('|') - 11);
+                        else if (line.StartsWith("sleep_cap=") && line.Length > 12)
+                            SleepCaps[line.Substring(12)] = line[10] == '1';
                         else if (line.StartsWith("afk_mon=") && line.Length > 10)
                             AfkMonitors[line.Substring(10)] = line[8] == '1';
                         else if (line.StartsWith("afk_min="))
@@ -1828,6 +2033,12 @@ namespace MonitorTray
                 };
                 foreach (KeyValuePair<string, bool> kv in AfkMonitors)
                     lines.Add("afk_mon=" + (kv.Value ? "1" : "0") + "|" + kv.Key);
+                foreach (KeyValuePair<string, bool> kv in SleepCaps)
+                    lines.Add("sleep_cap=" + (kv.Value ? "1" : "0") + "|" + kv.Key);
+                foreach (KeyValuePair<string, string> kv in InputCaps)
+                    lines.Add("input_cap=" + kv.Value + "|" + kv.Key);
+                foreach (KeyValuePair<string, string> kv in InputShow)
+                    lines.Add("input_show=" + kv.Value + "|" + kv.Key);
                 System.IO.File.WriteAllLines(UiFile(), lines.ToArray());
             }
             catch { }
@@ -1886,6 +2097,333 @@ namespace MonitorTray
             }
             catch { }
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96f;
+        }
+    }
+
+    // ------------------------------------------------------------------ DDC/CI: питание монитора
+    // Команда питания VCP 0xD6 (01 — включён, 04 — сон). Монитор отвечает по DDC/CI, как и на яркость.
+    internal static class Ddc
+    {
+        // физический монитор по GDI-имени экрана (\\.\DISPLAY2); закрывать через DestroyPhysicalMonitor
+        static IntPtr Open(string gdi)
+        {
+            foreach (Screen s in Screen.AllScreens)
+            {
+                if (s.DeviceName != gdi) continue;
+                IntPtr hMon = Native.MonitorFromPoint(new Point(s.Bounds.X + s.Bounds.Width / 2, s.Bounds.Y + s.Bounds.Height / 2), 2);
+                uint n;
+                if (!Native.GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out n) || n == 0) return IntPtr.Zero;
+                Native.PHYSICAL_MONITOR[] pm = new Native.PHYSICAL_MONITOR[n];
+                if (!Native.GetPhysicalMonitorsFromHMONITOR(hMon, n, pm)) return IntPtr.Zero;
+                for (int i = 1; i < pm.Length; i++) Native.DestroyPhysicalMonitor(pm[i].hPhysicalMonitor);
+                return pm[0].hPhysicalMonitor;
+            }
+            return IntPtr.Zero;
+        }
+
+        // список команд монитора (MCCS capabilities); DDC иногда молчит с первого раза — до трёх попыток.
+        // null — монитор не ответил
+        public static string Caps(string gdi)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (i > 0) Thread.Sleep(300);
+                string c = CapsOnce(gdi);
+                if (c != null) return c;
+            }
+            return null;
+        }
+
+        static string CapsOnce(string gdi)
+        {
+            IntPtr h = Open(gdi);
+            if (h == IntPtr.Zero) return null;
+            try
+            {
+                uint len;
+                if (!Native.GetCapabilitiesStringLength(h, out len) || len == 0) return null;
+                StringBuilder sb = new StringBuilder((int)len + 1);
+                return Native.CapabilitiesRequestAndCapabilitiesReply(h, sb, len) ? sb.ToString() : null;
+            }
+            catch { return null; }
+            finally { Native.DestroyPhysicalMonitor(h); }
+        }
+
+        // умеет спать: у команды питания D6 есть значение 04
+        public static bool CapsCanSleep(string caps)
+        {
+            Match d6 = Regex.Match(caps, @"D6\(([0-9A-Fa-f ]*)\)", RegexOptions.IgnoreCase);
+            return d6.Success && Regex.IsMatch(d6.Groups[1].Value, @"\b04\b");
+        }
+
+        // входы монитора — коды команды 60 через запятую («0F,11,12»); пусто — переключать нельзя
+        public static string CapsInputs(string caps)
+        {
+            Match m = Regex.Match(caps, @"(?<![0-9A-Fa-f])60\(([0-9A-Fa-f ]*)\)");
+            if (!m.Success) return "";
+            List<string> codes = new List<string>();
+            foreach (string c in m.Groups[1].Value.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                if (c.Length <= 2 && !codes.Contains(c.ToUpperInvariant().PadLeft(2, '0'))) codes.Add(c.ToUpperInvariant().PadLeft(2, '0'));
+            return string.Join(",", codes.ToArray());
+        }
+
+        // текущий вход монитора; -1 — не ответил. Код обычно в младшем байте, у некоторых — в старшем
+        public static int GetInput(string gdi)
+        {
+            IntPtr h = Open(gdi);
+            if (h == IntPtr.Zero) return -1;
+            try
+            {
+                uint cur, max;
+                if (!Native.GetVCPFeatureAndVCPFeatureReply(h, 0x60, IntPtr.Zero, out cur, out max)) return -1;
+                int v = (int)(cur & 0xFF);
+                if (v == 0) v = (int)((cur >> 8) & 0xFF);
+                return v;
+            }
+            catch { return -1; }
+            finally { Native.DestroyPhysicalMonitor(h); }
+        }
+
+        public static bool SetInput(string gdi, int code)
+        {
+            IntPtr h = Open(gdi);
+            if (h == IntPtr.Zero) return false;
+            try { return Native.SetVCPFeature(h, 0x60, (uint)code); }
+            catch { return false; }
+            finally { Native.DestroyPhysicalMonitor(h); }
+        }
+
+        public static bool SetPower(string gdi, bool on)
+        {
+            IntPtr h = Open(gdi);
+            if (h == IntPtr.Zero) return false;
+            try { return Native.SetVCPFeature(h, 0xD6, on ? 1u : 4u); }
+            catch { return false; }
+            finally { Native.DestroyPhysicalMonitor(h); }
+        }
+
+        // true — монитор точно включён (ответил «01»); нет ответа — считаем, что спит
+        public static bool IsPowerOn(string gdi)
+        {
+            IntPtr h = Open(gdi);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                uint cur, max;
+                return Native.GetVCPFeatureAndVCPFeatureReply(h, 0xD6, IntPtr.Zero, out cur, out max) && (cur & 0xFF) == 1;
+            }
+            catch { return false; }
+            finally { Native.DestroyPhysicalMonitor(h); }
+        }
+    }
+
+    // ------------------------------------------------------------------ подписи входов
+    internal static class InputNames
+    {
+        // тип разъёма по стандартному коду команды 60 (MCCS)
+        static string Kind(int code)
+        {
+            switch (code)
+            {
+                case 0x01: case 0x02: return "VGA";
+                case 0x03: case 0x04: return "DVI";
+                case 0x0F: case 0x10: return "DP";
+                case 0x11: case 0x12: return "HDMI";
+                case 0x1B: return "USB-C";
+                default: return null;
+            }
+        }
+
+        static int Number(int code) { return code == 0x02 || code == 0x04 || code == 0x10 || code == 0x12 ? 2 : 1; }
+
+        static string TechKind(uint tech)
+        {
+            switch (tech)
+            {
+                case 0: return "VGA";
+                case 4: return "DVI";
+                case 5: return "HDMI";
+                case 10: case 11: return "DP";
+                default: return null;
+            }
+        }
+
+        // как монитор подключён к компьютеру — для второй строки («DisplayPort», «HDMI»)
+        public static string Connection(uint tech)
+        {
+            string k = TechKind(tech);
+            return k == "DP" ? "DisplayPort" : k;
+        }
+
+        // Подпись входа. Стандартные коды — «DP 1», «HDMI 1». Монитор, который отвечает нестандартно
+        // (подключён по HDMI, а среди его кодов HDMI нет), — вход компьютера называем по подключению,
+        // остальные «Вход 1», «Вход 2»…
+        public static string Label(int code, List<int> all, uint tech, int pcInput)
+        {
+            string tk = TechKind(tech);
+            bool standard = tk == null;
+            foreach (int c in all) if (Kind(c) == tk) standard = true;
+            string k = Kind(code);
+            if (standard && k != null) return k + " " + Number(code);
+            if (!standard && code == pcInput && tk != null) return tk;
+            return string.Format(Loc.Get("input_n"), all.IndexOf(code) + 1);
+        }
+    }
+
+    // ------------------------------------------------------------------ сон монитора
+    // Монитор, который понимает команду питания DDC/CI, выключается «сном»: Windows ничего не
+    // перестраивает, поэтому остальные экраны не мигают (на NVIDIA с G-SYNC при отключении мигают),
+    // а окна остаются на своих местах. Просыпается, когда на него заходит курсор, или по кнопке в окне.
+    // Мониторы без этой команды выключаются как раньше — отключением.
+    internal class MonitorSleep
+    {
+        class Asleep { public string Key, Gdi, Name; public Rectangle Bounds; public bool Afk, CursorLeft; }
+
+        readonly TrayApp _app;
+        readonly List<Asleep> _asleep = new List<Asleep>();
+        readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
+        int _ticks;
+        bool _checking, _probing;
+
+        public MonitorSleep(TrayApp app)
+        {
+            _app = app;
+            _timer.Interval = 200;
+            _timer.Tick += delegate { Tick(); };
+            ProbeAsync();
+        }
+
+        // умеет ли монитор спать — узнаётся один раз по списку его команд и запоминается
+        public bool CanSleep(Mon m)
+        {
+            bool v;
+            return Ui.SleepCaps.TryGetValue(Ui.MonKey(m), out v) && v;
+        }
+
+        public bool IsAsleep(Mon m) { return Find(Ui.MonKey(m)) != null; }
+
+        public bool IsAfk(Mon m)
+        {
+            Asleep a = Find(Ui.MonKey(m));
+            return a != null && a.Afk;
+        }
+
+        public bool IsAsleepGdi(string gdi)
+        {
+            foreach (Asleep a in _asleep) if (a.Gdi == gdi) return true;
+            return false;
+        }
+
+        Asleep Find(string key)
+        {
+            foreach (Asleep a in _asleep) if (a.Key == key) return a;
+            return null;
+        }
+
+        // узнать (в фоне — DDC медленный), что умеют включённые мониторы: спать, переключать входы
+        public void ProbeAsync()
+        {
+            if (_probing) return;
+            List<Mon> todo = new List<Mon>();
+            foreach (Mon m in Svc.List())
+                if (m.Active && m.GdiName.Length > 0 &&
+                    (!Ui.SleepCaps.ContainsKey(Ui.MonKey(m)) || !Ui.InputCaps.ContainsKey(Ui.MonKey(m)))) todo.Add(m);
+            if (todo.Count == 0) return;
+            _probing = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, string> found = new Dictionary<string, string>();
+                foreach (Mon m in todo)
+                {
+                    string caps = Ddc.Caps(m.GdiName);
+                    if (caps != null) found[Ui.MonKey(m)] = caps; // не ответил — спросим в другой раз
+                }
+                _app.Post(delegate
+                {
+                    _probing = false;
+                    foreach (KeyValuePair<string, string> kv in found)
+                    {
+                        Ui.SleepCaps[kv.Key] = Ddc.CapsCanSleep(kv.Value);
+                        Ui.InputCaps[kv.Key] = Ddc.CapsInputs(kv.Value);
+                    }
+                    if (found.Count > 0) { Ui.Save(); _app.OnSleepChanged(); }
+                });
+            });
+        }
+
+        // усыпить монитор; false — монитор команду не принял
+        public bool Put(Mon m, bool afk)
+        {
+            if (!m.Active || IsAsleep(m)) return false;
+            if (!Ddc.SetPower(m.GdiName, false)) return false;
+            Asleep a = new Asleep();
+            a.Key = Ui.MonKey(m); a.Gdi = m.GdiName; a.Name = m.Name; a.Bounds = m.Bounds; a.Afk = afk;
+            a.CursorLeft = !m.Bounds.Contains(Cursor.Position);
+            _asleep.Add(a);
+            _ticks = 0;
+            _timer.Start();
+            return true;
+        }
+
+        public void Wake(Mon m)
+        {
+            Asleep a = Find(Ui.MonKey(m));
+            if (a != null) Wake(a, false);
+        }
+
+        void Wake(Asleep a, bool notify)
+        {
+            _asleep.Remove(a);
+            Ddc.SetPower(a.Gdi, true);
+            if (_asleep.Count == 0) _timer.Stop();
+            if (notify) _app.OnSleepChanged();
+        }
+
+        // при выходе из программы спящие мониторы просыпаются
+        public void WakeAll()
+        {
+            foreach (Asleep a in _asleep.ToArray()) Wake(a, false);
+            _timer.Stop();
+        }
+
+        // раскладка экранов поменялась (сменили основной монитор) — обновить, где спящие мониторы
+        public void RefreshBounds()
+        {
+            if (_asleep.Count == 0) return;
+            foreach (Mon m in Svc.List())
+            {
+                Asleep a = Find(Ui.MonKey(m));
+                if (a != null && m.Active) { a.Bounds = m.Bounds; a.Gdi = m.GdiName; }
+            }
+        }
+
+        void Tick()
+        {
+            // курсор ушёл со спящего монитора и вернулся на него — разбудить
+            Point p = Cursor.Position;
+            foreach (Asleep a in _asleep.ToArray())
+            {
+                bool inside = a.Bounds.Contains(p);
+                if (!inside) a.CursorLeft = true;
+                else if (a.CursorLeft) Wake(a, true);
+            }
+            // раз в 3 с: не разбудили ли монитор его собственной кнопкой
+            if (++_ticks % 15 != 0 || _checking || _asleep.Count == 0) return;
+            _checking = true;
+            Asleep[] list = _asleep.ToArray();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<string> awake = new List<string>();
+                foreach (Asleep a in list) if (Ddc.IsPowerOn(a.Gdi)) awake.Add(a.Key);
+                _app.Post(delegate
+                {
+                    _checking = false;
+                    if (awake.Count == 0) return;
+                    _asleep.RemoveAll(x => awake.Contains(x.Key));
+                    if (_asleep.Count == 0) _timer.Stop();
+                    _app.OnSleepChanged();
+                });
+            });
         }
     }
 
@@ -1991,7 +2529,7 @@ namespace MonitorTray
                 foreach (Screen sc in screens)
                 {
                     int t;
-                    if (hold || sc.Bounds.Contains(p) || !_seen.TryGetValue(sc.DeviceName, out t))
+                    if (hold || sc.Bounds.Contains(p) || _app.Sleep.IsAsleepGdi(sc.DeviceName) || !_seen.TryGetValue(sc.DeviceName, out t))
                     {
                         _seen[sc.DeviceName] = now;
                         continue;
@@ -2011,7 +2549,12 @@ namespace MonitorTray
             List<Mon> mons = Svc.List();
             Mon m = mons.Find(x => x.Active && x.GdiName == sc.DeviceName);
             if (m == null || !Ui.AfkIncluded(m)) return;
-            if (mons.FindAll(x => x.Active).Count < 2) return; // последний включённый не гасим
+            if (mons.FindAll(x => x.Active && !_app.Sleep.IsAsleep(x)).Count < 2) return; // последний включённый не гасим
+            if (_app.Sleep.CanSleep(m))
+            {
+                if (_app.Sleep.Put(m, true)) _app.OnAfkChanged(m.Name, true, true);
+                return;
+            }
             if (Svc.Disable(m, false) != 0) return;
             Sleeper s = new Sleeper();
             s.Key = Key(m); s.Name = m.Name; s.Gdi = sc.DeviceName; s.Bounds = sc.Bounds; s.WakeOnInput = wakeOnInput;
@@ -2331,6 +2874,7 @@ namespace MonitorTray
         const float IND = 34;    // отступ содержимого секций (под текст заголовка)
 
         // значки шрифта Segoe MDL2 Assets / Segoe Fluent Icons
+        const string G_INPUTS = "\uE8AB";
         const string G_MONITOR = "", G_SUN = "", G_GEAR = "", G_MOON = "",
             G_CLOSE = "", G_CHECK = "",
             G_DOWN = "", G_UP = "", G_CLOCK = "\uE823", G_DOWNLOAD = "\uE896";
@@ -2345,6 +2889,8 @@ namespace MonitorTray
         readonly ToolTip _tip = new ToolTip();
 
         List<Mon> _mons = new List<Mon>();
+        readonly Dictionary<string, int> _inputNow = new Dictionary<string, int>(); // монитор → текущий вход
+        bool _inputsOpen;                                                          // карточка «Входы мониторов»
         List<BrightEntry> _brights;          // живёт, пока окно открыто
         int _allValue;
         int _busyIdx = -1;
@@ -2412,7 +2958,9 @@ namespace MonitorTray
         public void ShowNearTray()
         {
             IntPtr h = Handle; // окно должно существовать до первой отрисовки
+            _app.Sleep.ProbeAsync(); // новый монитор — узнать, что он умеет
             Reload();
+            ReadInputsAsync();
             AnchorAt(Cursor.Position);
             Render();
             Show();
@@ -2444,6 +2992,63 @@ namespace MonitorTray
         {
             if (e.KeyCode == Keys.Escape) HidePopup();
             base.OnKeyDown(e);
+        }
+
+        // текущий вход каждого монитора, у которого есть что переключать (DDC медленный — в фоне)
+        void ReadInputsAsync()
+        {
+            List<Mon> todo = new List<Mon>();
+            foreach (Mon m in _mons)
+                if (m.Active && !_app.Sleep.IsAsleep(m) && Ui.Codes(Ui.InputCaps, Ui.MonKey(m)).Count >= 2) todo.Add(m);
+            if (todo.Count == 0) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, int> got = new Dictionary<string, int>();
+                foreach (Mon m in todo)
+                {
+                    int v = Ddc.GetInput(m.GdiName);
+                    if (v > 0) got[Ui.MonKey(m)] = v;
+                }
+                _app.Post(delegate
+                {
+                    foreach (KeyValuePair<string, int> kv in got) _inputNow[kv.Key] = kv.Value;
+                    if (Visible && got.Count > 0) Render();
+                });
+            });
+        }
+
+        void SwitchInput(Mon m, int code)
+        {
+            string key = Ui.MonKey(m);
+            int now;
+            if (_inputNow.TryGetValue(key, out now) && now == code) return;
+            _inputNow[key] = code;
+            Render();
+            string gdi = m.GdiName;
+            ThreadPool.QueueUserWorkItem(delegate { Ddc.SetInput(gdi, code); });
+        }
+
+        // входы для переключателя: отмеченные пользователем + вход, через который подключён этот ПК
+        // (он добавляется сам, чтобы всегда было куда вернуться); один вход — переключателя нет
+        static List<int> ShownInputs(string key, int pcInput)
+        {
+            List<int> show = Ui.Codes(Ui.InputShow, key);
+            if (pcInput > 0 && show.Count > 0 && !show.Contains(pcInput)) show.Add(pcInput);
+            List<int> all = Ui.Codes(Ui.InputCaps, key);
+            show.Sort((a, b) => all.IndexOf(a).CompareTo(all.IndexOf(b)));
+            return show;
+        }
+
+        // отметить / снять вход для переключателя в строке монитора (порядок — как у монитора)
+        void ToggleInputShown(string key, int code)
+        {
+            List<int> show = Ui.Codes(Ui.InputShow, key);
+            if (show.Contains(code)) show.Remove(code); else show.Add(code);
+            List<int> all = Ui.Codes(Ui.InputCaps, key);
+            show.Sort((a, b) => all.IndexOf(a).CompareTo(all.IndexOf(b)));
+            if (show.Count == 0) Ui.InputShow.Remove(key); else Ui.InputShow[key] = Ui.CodesToString(show);
+            Ui.Save();
+            Render();
         }
 
         void Reload()
@@ -2589,7 +3194,7 @@ namespace MonitorTray
 
             // --- мониторы
             int active = 0;
-            foreach (Mon m in _mons) if (m.Active) active++;
+            foreach (Mon m in _mons) if (m.Active && !_app.Sleep.IsAsleep(m)) active++;
             y = Section(g, G_MONITOR, Loc.Get("sec_monitors"), y,
                 _mons.Count > 0 ? string.Format(Loc.Get("count_on"), active, _mons.Count) : null);
             if (_mons.Count == 0)
@@ -2659,6 +3264,9 @@ namespace MonitorTray
             // AFK-режим — карточка с переключателем; когда включён, ниже выбор времени
             y = AfkCard(g, x0, x1, y);
 
+            // входы мониторов — какие показывать в переключателе HDMI / DP
+            y = InputsCard(g, x0, x1, y);
+
 
 
             return y + 8;
@@ -2685,33 +3293,95 @@ namespace MonitorTray
             Mon m = _mons[i];
             string id = "mon" + i;
             bool busy = _busyIdx == i;
-            RectangleF row = new RectangleF(cx - 10, y, x1 - cx + 14, 42);
+            RectangleF row = new RectangleF(cx - 10, y, x1 - cx + 14, 54);
             int idx = i;
+            string pid = "prim" + i;
+            bool rowHover = _hover == id || _hover == pid;
             Add(id, row, delegate { ToggleMonitor(idx); });
-            if (_hover == id) Fill(g, row, 6, Theme.Hover);
+            if (rowHover) Fill(g, row, 6, Theme.Hover);
 
-            MonitorIcon(g, new RectangleF(cx - 2, y + 9, 27, 23), i, m.Active);
+            bool asleep = m.Active && _app.Sleep.IsAsleep(m);
+            bool on = m.Active && !asleep;
+            MonitorIcon(g, new RectangleF(cx - 2, y + 15, 27, 23), i, on);
 
             // имя + метка («Основной» / «Выключен»)
             float sw = 46;                       // переключатель справа
             float nx = cx + 34, maxW = x1 - sw - 10 - nx;
             Font fn = Fonts.Get(Fonts.Regular, 14);
             Font fb = Fonts.Get(Fonts.Medium, 11);
-            string badge = !m.Active ? Loc.Get(_app.Afk.IsSleeping(m) ? "badge_afk" : "badge_off")
-                                     : (m.Primary ? Loc.Get("badge_primary") : null);
-            float bwid = badge != null ? g.MeasureString(badge, fb, PointF.Empty, FmtL).Width + 16 : 0;
+            string badge = asleep ? Loc.Get(_app.Sleep.IsAfk(m) ? "badge_afk" : "badge_sleep")
+                         : !m.Active ? Loc.Get(_app.Afk.IsSleeping(m) ? "badge_afk" : "badge_off")
+                         : (m.Primary ? Loc.Get("badge_primary") : null);
+            // при наведении на неосновной монитор вместо метки — кнопка «Сделать основным»
+            bool showPrim = badge == null && on && !m.Primary && rowHover && !busy;
+            string mp = Loc.Get("make_primary");
+            float bwid = badge != null ? g.MeasureString(badge, fb, PointF.Empty, FmtL).Width + 16
+                       : showPrim ? g.MeasureString(mp, fb, PointF.Empty, FmtL).Width + 18 : 0;
             float tw = g.MeasureString(m.Name, fn, PointF.Empty, FmtL).Width + 2;
-            float nameW = Math.Min(tw, maxW - (badge != null ? bwid + 8 : 0));
-            DrawText(g, m.Name, fn, m.Active ? Theme.Text : Theme.TextDim, new RectangleF(nx, y, nameW, row.Height), FmtL);
+            float nameW = Math.Min(tw, maxW - (bwid > 0 ? bwid + 8 : 0));
+            DrawText(g, m.Name, fn, on ? Theme.Text : Theme.TextDim, new RectangleF(nx, y + 5, nameW, 24), FmtL);
             if (badge != null)
             {
-                RectangleF rb = new RectangleF(nx + nameW + 8, y + row.Height / 2 - 10, bwid, 20);
-                Color bc = m.Active ? Theme.Accent : Theme.Off;
+                RectangleF rb = new RectangleF(nx + nameW + 8, y + 7, bwid, 20);
+                Color bc = on ? Theme.Accent : Theme.Off;
                 Fill(g, rb, 10, Color.FromArgb(Ui.DarkTheme ? 40 : 26, bc));
                 DrawText(g, badge, fb, bc, rb, FmtC);
             }
+            else if (showPrim)
+            {
+                RectangleF rp = new RectangleF(nx + nameW + 8, y + 7, bwid, 20);
+                Add(pid, rp, delegate { MakePrimary(idx); });
+                if (_hover == pid) Fill(g, rp, 10, Color.FromArgb(Ui.DarkTheme ? 40 : 26, Theme.Accent));
+                using (GraphicsPath pp = Round(rp, 10))
+                using (Pen pen = new Pen(Theme.Accent, 1f)) g.DrawPath(pen, pp);
+                DrawText(g, mp, fb, Theme.Accent, rp, FmtC);
+            }
 
-            Switch(g, new RectangleF(x1 - sw + 6, y + row.Height / 2 - 10, 40, 20), m.Active, _hover == id, busy);
+            // вторая строка: как подключён и переключатель входов (если отмечено хотя бы два)
+            string key = Ui.MonKey(m);
+            string conn = InputNames.Connection(m.Connection);
+            float lx = nx;
+            if (conn != null)
+            {
+                Font fc = Fonts.Get(Fonts.Regular, 11.5f);
+                DrawText(g, conn, fc, Theme.TextDim, new RectangleF(lx, y + 29, 120, 20), FmtL);
+                lx += g.MeasureString(conn, fc, PointF.Empty, FmtL).Width + 10;
+            }
+            int now;
+            bool known = _inputNow.TryGetValue(key, out now);
+            List<int> show = ShownInputs(key, known ? now : -1);
+            if (on && show.Count >= 2)
+            {
+                List<int> all = Ui.Codes(Ui.InputCaps, key);
+                Font fs = Fonts.Get(Fonts.Medium, 11);
+                float[] ws = new float[show.Count];
+                string[] labels = new string[show.Count];
+                float segW = 0;
+                for (int k = 0; k < show.Count; k++)
+                {
+                    labels[k] = InputNames.Label(show[k], all, m.Connection, known ? now : -1);
+                    ws[k] = g.MeasureString(labels[k], fs, PointF.Empty, FmtL).Width + 18;
+                    segW += ws[k];
+                }
+                RectangleF seg = new RectangleF(lx, y + 28, segW + 4, 22);
+                using (GraphicsPath p = Round(seg, 11))
+                using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+                float sx = seg.X + 2;
+                for (int k = 0; k < show.Count; k++)
+                {
+                    int code = show[k];
+                    string hid = "inp" + i + "_" + code;
+                    RectangleF rs = new RectangleF(sx, seg.Y + 2, ws[k], 18);
+                    Add(hid, rs, delegate { SwitchInput(m, code); });
+                    bool sel = known && now == code;
+                    if (sel) Fill(g, rs, 9, Theme.Accent);
+                    else if (_hover == hid) Fill(g, rs, 9, Theme.Hover);
+                    DrawText(g, labels[k], fs, sel ? Theme.AccentText : Theme.Text, rs, FmtC);
+                    sx += ws[k];
+                }
+            }
+
+            Switch(g, new RectangleF(x1 - sw + 6, y + row.Height / 2 - 10, 40, 20), on, _hover == id, busy);
             return y + row.Height + 2;
         }
 
@@ -2810,13 +3480,77 @@ namespace MonitorTray
                     RectangleF rr = new RectangleF(head.X + 44, ry, head.Width - 52, 32);
                     Add(id, rr, delegate { ToggleAfkMonitor(m); });
                     if (_hover == id) Fill(g, rr, 6, Theme.Hover);
-                    MonitorIcon(g, new RectangleF(rr.X + 8, ry + 8, 20, 17), i, m.Active);
+                    MonitorIcon(g, new RectangleF(rr.X + 8, ry + 8, 20, 17), i, m.Active && !_app.Sleep.IsAsleep(m));
                     DrawText(g, m.Name, Fonts.Get(Fonts.Regular, 13), Theme.Text, new RectangleF(rr.X + 36, ry, rr.Width - 36 - 56, 32), FmtL);
                     Switch(g, new RectangleF(head.Right - 54, ry + 6, 40, 20), Ui.AfkIncluded(m), _hover == id, false);
                     ry += 32;
                 }
             }
             return y + card.Height + 6;
+        }
+
+        // Карточка «Входы мониторов»: монитор не сообщает, во что что-то подключено, поэтому
+        // пользователь один раз отмечает нужные входы — в строке монитора появится переключатель.
+        // Мониторов, которые умеют переключать входы, нет — карточки нет.
+        float InputsCard(Graphics g, float x0, float x1, float y)
+        {
+            List<Mon> list = new List<Mon>();
+            foreach (Mon m in _mons) if (Ui.Codes(Ui.InputCaps, Ui.MonKey(m)).Count >= 2) list.Add(m);
+            if (list.Count == 0) return y;
+            bool open = _inputsOpen;
+            RectangleF head = new RectangleF(x0, y, x1 - x0, 60);
+            float h = 60 + (open ? 26 + list.Count * 62 + 4 : 0);
+            RectangleF card = new RectangleF(x0, y, x1 - x0, h);
+            Add("inputs", head, delegate { _inputsOpen = !_inputsOpen; Render(); });
+            Card(g, card, false);
+            if (_hover == "inputs")
+                using (GraphicsPath p = Round(head, 7))
+                using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillPath(b, p);
+            Glyph(g, G_INPUTS, 18, Theme.Accent, new RectangleF(head.X + 6, head.Y, 44, head.Height));
+            float tw = head.Width - 52 - 44;
+            DrawText(g, Loc.Get("inputs_title"), Fonts.Get(Fonts.Medium, 14), Theme.Text, new RectangleF(head.X + 52, head.Y + 10, tw, 21), FmtL);
+            DrawText(g, Loc.Get("inputs_sub"), Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim, new RectangleF(head.X + 52, head.Y + 31, tw, 18), FmtL);
+            Glyph(g, open ? G_UP : G_DOWN, 11, Theme.TextDim, new RectangleF(head.Right - 40, head.Y, 32, head.Height));
+            if (!open) return y + h + 6;
+
+            float yy = head.Y + 60;
+            DrawText(g, Loc.Get("inputs_hint"), Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim, new RectangleF(head.X + 52, yy, head.Width - 64, 20), FmtL);
+            yy += 26;
+            Font fc = Fonts.Get(Fonts.Medium, 11.5f);
+            for (int mi = 0; mi < list.Count; mi++)
+            {
+                Mon m = list[mi];
+                string key = Ui.MonKey(m);
+                MonitorIcon(g, new RectangleF(head.X + 52, yy + 6, 20, 17), _mons.IndexOf(m), m.Active && !_app.Sleep.IsAsleep(m));
+                DrawText(g, m.Name, Fonts.Get(Fonts.Regular, 13), Theme.Text, new RectangleF(head.X + 80, yy, head.Width - 92, 28), FmtL);
+                List<int> all = Ui.Codes(Ui.InputCaps, key);
+                List<int> show = Ui.Codes(Ui.InputShow, key);
+                int now;
+                bool known = _inputNow.TryGetValue(key, out now);
+                float cx = head.X + 52;
+                foreach (int code in all)
+                {
+                    bool pc = known && code == now; // через этот вход подключён компьютер
+                    string label = InputNames.Label(code, all, m.Connection, known ? now : -1) + (pc ? " · " + Loc.Get("this_pc") : "");
+                    float w = g.MeasureString(label, fc, PointF.Empty, FmtL).Width + 22;
+                    RectangleF rc = new RectangleF(cx, yy + 30, w, 24);
+                    string id = "inc" + mi + "_" + code;
+                    int cc = code;
+                    if (!pc) Add(id, rc, delegate { ToggleInputShown(key, cc); });
+                    bool sel = pc || show.Contains(code);
+                    if (sel) Fill(g, rc, 12, Theme.Accent);
+                    else
+                    {
+                        if (_hover == id) Fill(g, rc, 12, Theme.Hover);
+                        using (GraphicsPath p = Round(rc, 12))
+                        using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+                    }
+                    DrawText(g, label, fc, sel ? Theme.AccentText : Theme.Text, rc, FmtC);
+                    cx += w + 6;
+                }
+                yy += 62;
+            }
+            return y + h + 6;
         }
 
         // плашка «Доступна версия X» с кнопкой «Обновить» (во время загрузки — проценты)
@@ -3187,6 +3921,26 @@ namespace MonitorTray
             Render();
         }
 
+        void MakePrimary(int i)
+        {
+            if (_busyIdx >= 0 || i >= _mons.Count) return;
+            Mon m = _mons[i];
+            _busyIdx = i;
+            Render();
+            BeginInvoke((MethodInvoker)delegate
+            {
+                Busy = true;
+                try { _app.MakePrimary(m); }
+                finally { Busy = false; _busyIdx = -1; }
+                if (!Visible) return;
+                Reload();
+                AnchorAt(Cursor.Position); // панель задач переехала на новый основной монитор
+                Render();
+                Activate();
+                Native.SetForegroundWindow(Handle);
+            });
+        }
+
         void ToggleMonitor(int i)
         {
             if (_busyIdx >= 0 || i >= _mons.Count) return;
@@ -3467,6 +4221,7 @@ namespace MonitorTray
         TrayMenu _menu;
         readonly Control _ui = new Control();   // для передачи результатов фоновых потоков в UI
         internal AfkWatcher Afk;
+        internal MonitorSleep Sleep;
         internal Updater Updates;
         Version _announced;                       // о какой версии уже сказали в уведомлении
         internal static bool JustUpdated;         // запущены после автообновления
@@ -3488,6 +4243,7 @@ namespace MonitorTray
             // смена масштаба экрана — перерисовать значок под новый размер
             SystemEvents.DisplaySettingsChanged += OnSystemChanged;
 
+            Sleep = new MonitorSleep(this);
             Afk = new AfkWatcher(this);
             Updates = new Updater(this);
 
@@ -3506,8 +4262,8 @@ namespace MonitorTray
         // окно открыто или в нём идёт переключение — AFK-режим ждёт
         internal bool PopupBusy { get { return _popup.Visible || _popup.Busy; } }
 
-        // AFK-режим выключил или включил монитор
-        internal void OnAfkChanged(string name, bool off)
+        // AFK-режим выключил или включил монитор (ddc — усыпил, а не отключил)
+        internal void OnAfkChanged(string name, bool off, bool ddc = false)
         {
             UpdateTooltip();
             _popup.RefreshIfVisible();
@@ -3515,8 +4271,16 @@ namespace MonitorTray
             {
                 Ui.AfkHintShown = true;
                 Ui.Save();
-                _icon.ShowBalloonTip(8000, Loc.Get("tray_title"), string.Format(Loc.Get("afk_off_hint"), name), ToolTipIcon.Info);
+                _icon.ShowBalloonTip(8000, Loc.Get("tray_title"),
+                    string.Format(Loc.Get(ddc ? "afk_off_hint_ddc" : "afk_off_hint"), name), ToolTipIcon.Info);
             }
+        }
+
+        // спящий монитор проснулся (курсор зашёл на него или нажали его кнопку)
+        internal void OnSleepChanged()
+        {
+            UpdateTooltip();
+            _popup.RefreshIfVisible();
         }
 
         // у автообновления новости: нашлась версия, идёт загрузка, ошибка
@@ -3548,7 +4312,7 @@ namespace MonitorTray
             {
                 List<Mon> mons = Svc.List();
                 int active = 0;
-                foreach (Mon m in mons) if (m.Active) active++;
+                foreach (Mon m in mons) if (m.Active && (Sleep == null || !Sleep.IsAsleep(m))) active++;
                 string t = string.Format(Loc.Get("tooltip"), active, mons.Count);
                 if (t.Length > 63) t = t.Substring(0, 63);
                 _icon.Text = t;
@@ -3580,10 +4344,48 @@ namespace MonitorTray
             if (!_popup.Visible) _popup.ShowNearTray();
         }
 
+        internal void MakePrimary(Mon m)
+        {
+            int hr = Svc.SetPrimary(m, false);
+            if (hr == 0)
+                _icon.ShowBalloonTip(2500, Loc.Get("tray_title"), string.Format(Loc.Get("primary_done"), m.Name), ToolTipIcon.Info);
+            else
+                _icon.ShowBalloonTip(4000, Loc.Get("tray_title"), string.Format(Loc.Get("failed"), m.Name, Svc.LastError), ToolTipIcon.Error);
+            Sleep.RefreshBounds();
+            UpdateTooltip();
+        }
+
         internal void Toggle(Mon m)
         {
             Afk.Forget(m); // включили/выключили вручную — AFK-режим этот монитор больше не ведёт
             int hr;
+            // спит — разбудить
+            if (m.Active && Sleep.IsAsleep(m))
+            {
+                Sleep.Wake(m);
+                _icon.ShowBalloonTip(2500, Loc.Get("tray_title"), string.Format(Loc.Get("on_done"), m.Name), ToolTipIcon.Info);
+                UpdateTooltip();
+                return;
+            }
+            if (m.Active)
+            {
+                // последний включённый монитор не выключаем (спящие не в счёт)
+                int awake = 0;
+                foreach (Mon x in Svc.List()) if (x.Active && !Sleep.IsAsleep(x)) awake++;
+                if (awake < 2)
+                {
+                    _icon.ShowBalloonTip(4000, Loc.Get("tray_title"),
+                        string.Format(Loc.Get("failed"), m.Name, Loc.Get("last_monitor")), ToolTipIcon.Warning);
+                    return;
+                }
+                // умеет спать — усыпить: Windows ничего не перестраивает, другие экраны не мигают
+                if (Sleep.CanSleep(m) && Sleep.Put(m, false))
+                {
+                    _icon.ShowBalloonTip(2500, Loc.Get("tray_title"), string.Format(Loc.Get("off_done"), m.Name), ToolTipIcon.Info);
+                    UpdateTooltip();
+                    return;
+                }
+            }
             if (m.Active)
             {
                 hr = Svc.Disable(m, false);
@@ -3609,6 +4411,7 @@ namespace MonitorTray
             _popup.HidePopup();
             _menu.HideMenu();
             Afk.WakeAll(); // не оставлять мониторы выключенными после выхода
+            Sleep.WakeAll();
             SystemEvents.DisplaySettingsChanged -= OnSystemChanged;
             _icon.Visible = false;
             _icon.Dispose();
@@ -3639,10 +4442,11 @@ namespace MonitorTray
             if (cmd == "bright")
             {
                 List<BrightEntry> bs = Bright.Open();
-                if (bs.Count == 0) Console.WriteLine("no DDC-capable monitors");
+                if (bs.Count == 0) Console.WriteLine("no monitors with brightness control (DDC/CI or laptop panel)");
                 foreach (BrightEntry e in bs)
                 {
-                    Console.WriteLine(e.Gdi + ": " + Bright.ToPercent(e) + "%  (raw " + e.Min + ".." + e.Cur + ".." + e.Max + ")");
+                    Console.WriteLine(e.Gdi + ": " + Bright.ToPercent(e) + "%" +
+                        (e.Wmi != null ? "  (laptop panel, WMI)" : "  (raw " + e.Min + ".." + e.Cur + ".." + e.Max + ")"));
                 }
                 Bright.Close(bs);
                 return 0;
@@ -3687,6 +4491,18 @@ namespace MonitorTray
                 return 0;
             }
 
+            if (cmd == "primary")
+            {
+                int pidx;
+                if (args.Length < 2 || !int.TryParse(args[1], out pidx) || pidx < 1) { Usage(); return 2; }
+                List<Mon> pm = Svc.List();
+                if (pidx > pm.Count) { Console.WriteLine("No monitor with index " + pidx); return 1; }
+                int phr = Svc.SetPrimary(pm[pidx - 1], true);
+                Console.WriteLine("primary " + pidx + " '" + pm[pidx - 1].Name + "' -> 0x" + phr.ToString("X") +
+                    (phr == 0 ? " OK" : " FAILED (" + Svc.LastError + ")"));
+                return phr == 0 ? 0 : 1;
+            }
+
             if (cmd == "on" || cmd == "off" || cmd == "toggle")
             {
                 if (args.Length < 2) { Usage(); return 2; }
@@ -3723,7 +4539,7 @@ namespace MonitorTray
 
         static void Usage()
         {
-            Console.WriteLine("Usage: MonitorTray list | on N | off N | toggle N | restore | dpms-off | bright | dbg");
+            Console.WriteLine("Usage: MonitorTray list | on N | off N | toggle N | primary N | restore | dpms-off | bright | dbg");
         }
     }
 

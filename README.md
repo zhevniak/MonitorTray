@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.png?v=1.3" width="96" alt="MonitorTray icon">
+  <img src="docs/icon.png?v=1.4" width="96" alt="MonitorTray icon">
 </p>
 
 <h1 align="center">MonitorTray</h1>
@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/window-light.png?v=1.3" width="400" alt="MonitorTray — light theme">
-  <img src="docs/window-dark.png?v=1.3" width="400" alt="MonitorTray — dark theme, per-monitor brightness">
+  <img src="docs/window-light.png?v=1.4" width="400" alt="MonitorTray — light theme">
+  <img src="docs/window-dark.png?v=1.4" width="400" alt="MonitorTray — dark theme, per-monitor brightness">
 </p>
 
 Do you have a second (or third) monitor that you only use sometimes, but it stays on and glows in the corner? MonitorTray puts every monitor one click away: click to turn it off, click again to turn it back on.
@@ -28,11 +28,14 @@ It works even with monitors that **don't support DDC/CI power control** — tool
 ## Features
 
 - 🖥 **Per-monitor power** — turn any monitor off / on with its switch; works without DDC/CI
+- 😴 **Sleep without flicker** — monitors that understand the DDC/CI power command just go to sleep: the other screens don't blink and windows stay where they are
+- ⭐ **Choose the primary monitor** right from the window
+- 🔀 **HDMI / DP input switch** — flip a monitor between this PC and a laptop or console
 - 🪟 **Puts your windows back** — windows that lived on a monitor return to their places when it comes back, including maximized / minimized ones
 - 📏 **Remembers resolution & refresh rate** — a custom mode like 1600×1024@165 is restored instead of jumping to the native default
-- ☀️ **Brightness control** — one slider for all screens, or a separate slider for each monitor (for monitors that support DDC/CI)
+- ☀️ **Brightness control** — one slider for all screens, or a separate slider for each monitor: external monitors over DDC/CI, and the built-in screen of a laptop
 - 🌙 **Put all screens to sleep** — one click, they wake on the first mouse move
-- 💤 **AFK mode** — a monitor the cursor hasn't visited for a while turns off by itself and comes back with a push of the mouse (off by default)
+- 💤 **AFK mode** — a monitor the cursor hasn't visited for a while turns off by itself and comes back when you need it (off by default)
 - 🔄 **Automatic updates** — new versions are found on GitHub and installed with one click, verified by SHA-256
 - 🎨 **Windows 11-style window** — light and dark theme, rounded corners and a soft shadow (on Windows 10 too), crisp Roboto font
 - 🔵 **Colorful tray icon** that follows the theme you pick
@@ -56,31 +59,42 @@ No admin rights required. If Windows shows *"Windows protected your PC"*, see [S
 
 ### Monitors
 
-Click a monitor row or its switch to turn that monitor off; click again to turn it back on. The **Primary** badge marks the main display, a turned-off monitor shows a dark screen and an **Off** badge.
+Click a monitor row or its switch to turn that monitor off; click again to turn it back on. The second line shows how the monitor is connected (DisplayPort, HDMI…). The **Primary** badge marks the main display; hover over another monitor and press **Make primary** to change it (same as *Make this my main display* in Windows Settings).
 
-- Turning off the primary monitor is supported: the remaining one becomes primary, and everything is restored when you turn it back on
-- Turning off the **last** active monitor is blocked on purpose, so you never end up with a black screen
+How a monitor is turned off depends on what it can do — MonitorTray figures this out by itself:
+
+- **Sleep** (badge *Sleep*) — for monitors that support the DDC/CI power command. Windows doesn't rebuild the desktop, so the other screens don't blink and windows stay in place. The monitor wakes up when you move the cursor onto it, or with its switch
+- **Disconnect** (badge *Off*) — for all other monitors, the same as *Disconnect this display* in Windows: the monitor loses signal, its windows move to the other screens and come back when it's turned on again
+- Turning off the **last** monitor that is on is blocked on purpose, so you never end up with a black screen
+
+### Inputs (HDMI / DP)
+
+If a laptop or a console is plugged into the same monitor, MonitorTray can switch the monitor between them. Monitors don't report which inputs have a cable in them, so mark them once in **Actions & settings → Monitor inputs** — the input of this PC is marked automatically. A switch then appears in the monitor's row:
+
+<p align="center">
+  <img src="docs/window-inputs.png?v=1.4" width="400" alt="HDMI / DP switch in the monitor row and the Monitor inputs card">
+</p>
 
 ### Brightness
 
 The **All screens** slider changes every monitor at once. Press **Per monitor** to show a separate slider for each monitor — press it again to hide them. You can also use the mouse wheel over any slider.
 
-Brightness works over DDC/CI; if no monitor supports it, the section is simply hidden (power control does not need DDC/CI).
+External monitors are controlled over DDC/CI, the built-in screen of a laptop — the same way as the Windows brightness slider. If no screen supports it, the section is simply hidden (power control does not need DDC/CI).
 
 ### Actions & settings
 
-**Put all screens to sleep** and **AFK mode**. Click the section header to collapse it when you don't need it:
+**Put all screens to sleep**, **AFK mode** and **Monitor inputs**. Click the section header to collapse it when you don't need it:
 
 <p align="center">
-  <img src="docs/window-compact.png?v=1.3" width="400" alt="Compact view with the settings collapsed">
-  <img src="docs/window-russian.png?v=1.3" width="400" alt="Russian interface, dark theme">
+  <img src="docs/window-compact.png?v=1.4" width="400" alt="Compact view with the settings collapsed">
+  <img src="docs/window-russian.png?v=1.4" width="400" alt="Russian interface, dark theme">
 </p>
 
 ### AFK mode
 
 Turn it on in *Actions & settings* and set your own time with **−** / **+** or the mouse wheel — from 1 minute to 4 hours, 30 minutes by default. A monitor the mouse cursor hasn't visited for that long turns off by itself (handy for OLED screens and for a second monitor you only glance at). It is **off by default**.
 
-- **Turning it back on:** push the mouse against the screen edge on the side where that monitor is, or click it in the window. If it turned off while you were away from the PC, it comes back on by itself with your first mouse move or key press
+- **Turning it back on:** a monitor that went to *sleep* wakes up as soon as you move the cursor onto it. A *disconnected* one comes back when you push the mouse against the screen edge on its side, or click it in the window; if it turned off while you were away from the PC, it comes back by itself with your first mouse move or key press
 - **Choose the monitors:** each monitor has its own switch in the AFK card — by default all of them except the primary one
 - **It never interrupts you:** the monitor with the cursor and the last monitor that is still on are never turned off, and nothing happens while a video is playing or a fullscreen game / movie is on that monitor
 - Monitors turned off by AFK mode show an **AFK** badge, and they are turned back on when you exit MonitorTray
@@ -93,12 +107,12 @@ Once a day MonitorTray checks GitHub for a new release (*Check for updates* in t
 
 - The **moon / sun** button in the top corner switches between the light and dark theme — the tray icon changes with it:
 
-  <img src="docs/tray-icon.png?v=1.3" width="384" alt="Tray icon in the light and dark theme, on a dark and a light taskbar">
+  <img src="docs/tray-icon.png?v=1.4" width="384" alt="Tray icon in the light and dark theme, on a dark and a light taskbar">
 
 - The **✕** button, a click anywhere outside the window or **Esc** hide it to the tray. To quit, right-click the tray icon → **Exit**:
 
-  <img src="docs/tray-menu.png?v=1.3" width="300" alt="Tray icon right-click menu">
-- All settings — theme, language, AFK mode, per-monitor sliders, collapsed sections — are remembered
+  <img src="docs/tray-menu.png?v=1.4" width="300" alt="Tray icon right-click menu">
+- All settings — theme, language, AFK mode, inputs, per-monitor sliders, collapsed sections — are remembered
 
 ## Command line
 
@@ -109,9 +123,10 @@ MonitorTray list          show monitors (index, name, state, resolution)
 MonitorTray off 2         turn monitor #2 off
 MonitorTray on 2          turn monitor #2 on
 MonitorTray toggle 2      toggle monitor #2
+MonitorTray primary 2     make monitor #2 the primary one
 MonitorTray restore       restore the topology saved by Windows (emergency)
 MonitorTray dpms-off      put all screens to sleep
-MonitorTray bright        show the brightness of DDC/CI monitors
+MonitorTray bright        show the brightness of DDC/CI monitors and the laptop screen
 MonitorTray dbg           dump display diagnostics (read-only)
 ```
 
@@ -125,7 +140,8 @@ MonitorTray talks to the Windows **Connect and Configure Display (CCD)** API:
 - turning a monitor off = applying the topology without that monitor's path, so Windows drops the video output (same as "Disconnect this display" in Settings)
 - turning it on = re-adding the stored path from `QDC_ALL_PATHS`, with `ChangeDisplaySettingsEx` as a fallback
 - monitor names come from WMI (`WmiMonitorID`) and EDID, mapped to CCD targets by UID and source-mode position
-- brightness uses the Monitor Configuration API (DDC/CI: `GetMonitorBrightness` / `SetMonitorBrightness`)
+- brightness uses the Monitor Configuration API (DDC/CI: `GetMonitorBrightness` / `SetMonitorBrightness`), the laptop screen — WMI (`WmiMonitorBrightnessMethods`)
+- sleep and input switching are DDC/CI VCP codes `0xD6` (power mode) and `0x60` (input source); what a monitor supports is read once from its MCCS capabilities string
 
 Real-world quirks it already handles (Windows 10 22H2 + NVIDIA, incl. 580.x drivers):
 
@@ -163,6 +179,8 @@ Windows SmartScreen says *"unknown publisher"* for **any** app without an (expen
 - **A monitor didn't come back on** — run `MonitorTray restore`, open *Settings → Display*, or replug the cable
 - **The resolution changed after turning a monitor on** — it is restored on the next off/on cycle (the mode is saved when the monitor turns off)
 - **The tray icon disappeared** — look in the `^` overflow area of the tray
+- **Other screens blink for a moment when a monitor is turned off** — this is the NVIDIA driver with **G-SYNC** on: when a monitor is disconnected, it restarts the G-SYNC display. Monitors that can *sleep* (see above) never cause it; for the others it goes away if G-SYNC is off. Turning a monitor back **on** doesn't blink
+- **Switched a monitor to an input with nothing plugged in** — use the input button on the monitor to come back; mark only inputs that really have a device in *Monitor inputs*
 - **Settings files** live in `%APPDATA%` as `MonitorTray_*.txt` — delete them to reset everything
 
 ## Build from source
