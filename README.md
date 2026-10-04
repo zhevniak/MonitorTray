@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.png" width="96" alt="MonitorTray icon">
+  <img src="docs/icon.png?v=1.3" width="96" alt="MonitorTray icon">
 </p>
 
 <h1 align="center">MonitorTray</h1>
@@ -17,8 +17,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/window-light.png" width="400" alt="MonitorTray — light theme">
-  <img src="docs/window-dark.png" width="400" alt="MonitorTray — dark theme, per-monitor brightness">
+  <img src="docs/window-light.png?v=1.3" width="400" alt="MonitorTray — light theme">
+  <img src="docs/window-dark.png?v=1.3" width="400" alt="MonitorTray — dark theme, per-monitor brightness">
 </p>
 
 Do you have a second (or third) monitor that you only use sometimes, but it stays on and glows in the corner? MonitorTray puts every monitor one click away: click to turn it off, click again to turn it back on.
@@ -72,8 +72,8 @@ Brightness works over DDC/CI; if no monitor supports it, the section is simply h
 **Put all screens to sleep** and **AFK mode**. Click the section header to collapse it when you don't need it:
 
 <p align="center">
-  <img src="docs/window-compact.png" width="400" alt="Compact view with the settings collapsed">
-  <img src="docs/window-russian.png" width="400" alt="Russian interface, dark theme">
+  <img src="docs/window-compact.png?v=1.3" width="400" alt="Compact view with the settings collapsed">
+  <img src="docs/window-russian.png?v=1.3" width="400" alt="Russian interface, dark theme">
 </p>
 
 ### AFK mode
@@ -93,11 +93,11 @@ Once a day MonitorTray checks GitHub for a new release (*Check for updates* in t
 
 - The **moon / sun** button in the top corner switches between the light and dark theme — the tray icon changes with it:
 
-  <img src="docs/tray-icon.png" width="384" alt="Tray icon in the light and dark theme, on a dark and a light taskbar">
+  <img src="docs/tray-icon.png?v=1.3" width="384" alt="Tray icon in the light and dark theme, on a dark and a light taskbar">
 
 - The **✕** button, a click anywhere outside the window or **Esc** hide it to the tray. To quit, right-click the tray icon → **Exit**:
 
-  <img src="docs/tray-menu.png" width="300" alt="Tray icon right-click menu">
+  <img src="docs/tray-menu.png?v=1.3" width="300" alt="Tray icon right-click menu">
 - All settings — theme, language, AFK mode, per-monitor sliders, collapsed sections — are remembered
 
 ## Command line
