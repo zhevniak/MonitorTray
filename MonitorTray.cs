@@ -8,6 +8,9 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.IO;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Management;
 using System.Text;
@@ -24,8 +27,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace MonitorTray
 {
@@ -289,6 +292,32 @@ namespace MonitorTray
 
         [DllImport("dwmapi.dll")]
         public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int attrValue, int attrSize);
+
+        // ---- яркость мониторов через DDC/CI (Windows Monitor Configuration API) ----
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct PHYSICAL_MONITOR
+        {
+            public IntPtr hPhysicalMonitor;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szPhysicalMonitorDescription;
+        }
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr MonitorFromPoint(Point pt, uint dwFlags);
+
+        [DllImport("dxva2.dll", CharSet = CharSet.Unicode)]
+        public static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint pdwNumberOfPhysicalMonitors);
+
+        [DllImport("dxva2.dll", CharSet = CharSet.Unicode)]
+        public static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint dwPhysicalMonitorArraySize, [Out] PHYSICAL_MONITOR[] lpPhysicalMonitorArray);
+
+        [DllImport("dxva2.dll")]
+        public static extern bool GetMonitorBrightness(IntPtr hMonitor, out uint pdwMinimumBrightness, out uint pdwCurrentBrightness, out uint pdwMaximumBrightness);
+
+        [DllImport("dxva2.dll")]
+        public static extern bool SetMonitorBrightness(IntPtr hMonitor, uint dwNewBrightness);
+
+        [DllImport("dxva2.dll")]
+        public static extern bool DestroyPhysicalMonitor(IntPtr hMonitor);
 
         public static int Query(uint flags, out DISPLAYCONFIG_PATH_INFO[] paths, out DISPLAYCONFIG_MODE_INFO[] modes)
         {
@@ -684,11 +713,14 @@ namespace MonitorTray
         static int TrySet(Native.DISPLAYCONFIG_PATH_INFO[] paths, Native.DISPLAYCONFIG_MODE_INFO[] modes, bool verbose)
         {
             uint vf = _virtual ? Native.SDC_VIRTUAL_MODE_AWARE : 0;
+            // Комбинации с SDC_NO_OPTIMIZATION идут первыми: Windows вносит
+            // минимальные изменения и не пере-применяет нетронутые выходы,
+            // поэтому оставшийся монитор не мигает.
             uint[] flagSets = new uint[] {
-                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | vf,
                 Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_NO_OPTIMIZATION | Native.SDC_ALLOW_PATH_ORDER_CHANGES | vf,
-                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_SAVE_TO_DATABASE | vf,
                 Native.SDC_APPLY | Native.SDC_NO_OPTIMIZATION | Native.SDC_ALLOW_PATH_ORDER_CHANGES | vf,
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | vf,
+                Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_SAVE_TO_DATABASE | vf,
                 Native.SDC_APPLY | Native.SDC_NO_OPTIMIZATION | vf
             };
             int hr = -1;
@@ -1163,8 +1195,8 @@ namespace MonitorTray
             dm.dmPosition.y = 30000;
             int r1 = Native.ChangeDisplaySettingsEx(gdi, ref dm, IntPtr.Zero,
                 Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
-            int r2 = Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-            return r1 != 0 ? r1 : r2;
+            if (r1 != 0) return r1; // при неудаче не дёргаем все выходы понапрасну
+            return Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
         static int EnableCds(string gdi)
@@ -1179,8 +1211,8 @@ namespace MonitorTray
             dm.dmPosition.y = vs.Top;
             int r1 = Native.ChangeDisplaySettingsEx(gdi, ref dm, IntPtr.Zero,
                 Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
-            int r2 = Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-            return r1 != 0 ? r1 : r2;
+            if (r1 != 0) return r1; // при неудаче не дёргаем все выходы понапрасну
+            return Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
     }
 
@@ -1356,61 +1388,144 @@ namespace MonitorTray
         }
     }
 
-    // ------------------------------------------------------------------ иконка
-    internal static class AppIcon
+    // ---------------------------------------------------- яркость (DDC/CI)
+    internal class BrightEntry
     {
-        public static Icon Create()
+        public IntPtr Handle;
+        public string Gdi;
+        public uint Min, Cur, Max;   // сырой диапазон DDC
+        public int? Pending;         // 0..100, применить отложенно
+        public int Value;            // 0..100, что показывает ползунок
+    }
+
+    internal static class Bright
+    {
+        public static List<BrightEntry> Open()
         {
-            // встроенный в exe файл MonitorTray.ico
-            try
+            List<BrightEntry> res = new List<BrightEntry>();
+            foreach (Screen s in Screen.AllScreens)
             {
-                System.Reflection.Assembly asm = System.Reflection.Assembly.GetExecutingAssembly();
-                foreach (string n in asm.GetManifestResourceNames())
+                IntPtr hMon = Native.MonitorFromPoint(
+                    new Point(s.Bounds.X + s.Bounds.Width / 2, s.Bounds.Y + s.Bounds.Height / 2), 2 /*NEAREST*/);
+                if (hMon == IntPtr.Zero) continue;
+                uint cnt;
+                if (!Native.GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out cnt) || cnt == 0) continue;
+                Native.PHYSICAL_MONITOR[] pm = new Native.PHYSICAL_MONITOR[cnt];
+                if (!Native.GetPhysicalMonitorsFromHMONITOR(hMon, cnt, pm)) continue;
+                foreach (Native.PHYSICAL_MONITOR p in pm)
                 {
-                    if (n.EndsWith(".ico", StringComparison.OrdinalIgnoreCase))
+                    uint mn, cur, mx;
+                    if (Native.GetMonitorBrightness(p.hPhysicalMonitor, out mn, out cur, out mx) && mx > mn)
                     {
-                        using (System.IO.Stream st = asm.GetManifestResourceStream(n))
-                        {
-                            if (st != null)
-                            {
-                                Icon big = new Icon(st);
-                                return new Icon(big, 32, 32);
-                            }
-                        }
+                        BrightEntry e = new BrightEntry();
+                        e.Handle = p.hPhysicalMonitor;
+                        e.Gdi = s.DeviceName;
+                        e.Min = mn; e.Cur = cur; e.Max = mx;
+                        res.Add(e);
+                    }
+                    else
+                    {
+                        Native.DestroyPhysicalMonitor(p.hPhysicalMonitor); // яркость не поддерживается
                     }
                 }
             }
-            catch { }
-            return DrawFallback();
+            return res;
         }
 
-        static Icon DrawFallback()
+        public static void Close(List<BrightEntry> list)
         {
-            using (Bitmap bmp = new Bitmap(32, 32))
+            if (list == null) return;
+            foreach (BrightEntry e in list)
             {
-                using (Graphics g = Graphics.FromImage(bmp))
+                try { Native.DestroyPhysicalMonitor(e.Handle); } catch { }
+            }
+        }
+
+        public static int ToPercent(BrightEntry e)
+        {
+            return (int)((e.Cur - e.Min) * 100 / (e.Max - e.Min));
+        }
+
+        public static void Apply(BrightEntry e, int percent)
+        {
+            try
+            {
+                uint v = e.Min + (uint)((e.Max - e.Min) * percent / 100);
+                Native.SetMonitorBrightness(e.Handle, v);
+                e.Cur = v;
+            }
+            catch { }
+        }
+    }
+
+    // ------------------------------------------------------------------ иконка
+    // Значок в трее в стиле Windows 11: цветной монитор на скруглённой плитке, плитка — по теме
+    // программы (светлая в светлой теме, тёмная — в тёмной). Плитка со своим фоном
+    // хорошо видна на любой панели задач, светлой или тёмной.
+    internal static class AppIcon
+    {
+        [DllImport("user32.dll")]
+        static extern bool DestroyIcon(IntPtr hIcon);
+
+        static GraphicsPath Tile(float x, float y, float w, float h, float d)
+        {
+            GraphicsPath p = new GraphicsPath();
+            p.AddArc(x, y, d, d, 180, 90);
+            p.AddArc(x + w - d, y, d, d, 270, 90);
+            p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            p.AddArc(x, y + h - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        public static Icon Create(bool dark)
+        {
+            using (Bitmap bmp = Render(Math.Max(16, SystemInformation.SmallIconSize.Width), dark))
+            {
+                IntPtr hIcon = bmp.GetHicon();
+                Icon icon = (Icon)Icon.FromHandle(hIcon).Clone();
+                DestroyIcon(hIcon);
+                return icon;
+            }
+        }
+
+        // картинка значка любого размера (из неё же собран MonitorTray.ico)
+        public static Bitmap Render(int size, bool dark)
+        {
+            // рисуем в 4 раза крупнее и плавно уменьшаем — гладкие края без «лесенки»
+            int ss = size * 4;
+            Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Bitmap big = new Bitmap(ss, ss, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(big))
                 {
                     g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                     g.Clear(Color.Transparent);
-                    using (SolidBrush bezel = new SolidBrush(Color.FromArgb(52, 58, 72)))
+                    g.ScaleTransform(ss / 32f, ss / 32f); // сетка 32×32
+                    RectangleF tr = new RectangleF(0.5f, 0.5f, 31, 31);
+                    using (GraphicsPath p = Tile(tr.X, tr.Y, tr.Width, tr.Height, 15))
                     {
-                        g.FillRectangle(bezel, 2, 3, 28, 20);
-                        g.FillRectangle(bezel, 13, 23, 6, 4);
-                        g.FillRectangle(bezel, 9, 27, 14, 3);
+                        using (LinearGradientBrush b = new LinearGradientBrush(tr,
+                            dark ? Color.FromArgb(62, 62, 68) : Color.White,
+                            dark ? Color.FromArgb(36, 36, 40) : Color.FromArgb(232, 236, 243), 90f))
+                            g.FillPath(b, p);
+                        using (Pen pen = new Pen(dark ? Color.FromArgb(80, 255, 255, 255) : Color.FromArgb(50, 0, 0, 0), 1.4f))
+                            g.DrawPath(pen, p);
                     }
-                    using (LinearGradientBrush scr = new LinearGradientBrush(
-                        new Rectangle(4, 5, 24, 16), Color.FromArgb(26, 32, 44), Color.FromArgb(12, 16, 24), 90f))
-                        g.FillRectangle(scr, 4, 5, 24, 16);
-                    using (Pen p = new Pen(Color.FromArgb(0, 200, 255), 2.6f))
-                    {
-                        p.StartCap = LineCap.Round;
-                        p.EndCap = LineCap.Round;
-                        g.DrawArc(p, 11.5f, 8.6f, 9f, 9f, 315f, 270f);
-                        g.DrawLine(p, 16f, 6.8f, 16f, 12.4f);
-                    }
+                    // тот же цветной монитор, что и в окне программы
+                    Popup.MonitorIcon(g, new RectangleF(3, 4.5f, 26, 23), 0, true);
                 }
-                return Icon.FromHandle(bmp.GetHicon());
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
+                    g.Clear(Color.Transparent);
+                    g.DrawImage(big, new Rectangle(0, 0, size, size));
+                }
             }
+            return bmp;
         }
     }
 
@@ -1483,17 +1598,22 @@ namespace MonitorTray
             switch (key)
             {
                 case "tray_title": return ru ? "Мониторы" : "Monitors";
-                case "menu_title": return ru ? "Мониторы — вкл: {0}" : "Monitors — on: {0}";
-                case "primary": return ru ? "  — основной" : "  — primary";
-                case "turn_on": return ru ? "  — включить" : "  — turn on";
-                case "tip_off": return ru ? "Нажмите, чтобы выключить" : "Click to turn this monitor off";
-                case "tip_on": return ru ? "Монитор выключен. Нажмите, чтобы включить" : "This monitor is off. Click to turn it on";
                 case "no_monitors": return ru ? "Мониторы не найдены" : "No monitors found";
-                case "dpms": return ru ? "Погасить все экраны (до 1-го движения мыши)" : "Put all screens to sleep (until first mouse move)";
+                case "sec_monitors": return ru ? "Мониторы" : "Monitors";
+                case "sec_bright": return ru ? "Управление яркостью" : "Brightness";
+                case "sec_actions": return ru ? "Действия и настройки" : "Actions & settings";
+                case "count_on": return ru ? "вкл. {0} из {1}" : "{0} of {1} on";
+                case "badge_primary": return ru ? "Основной" : "Primary";
+                case "badge_off": return ru ? "Выключен" : "Off";
+                case "bright_all": return ru ? "Общая яркость (все экраны)" : "All screens";
+                case "sleep_title": return ru ? "Погасить все экраны" : "Put all screens to sleep";
+                case "sleep_hint": return ru ? "до первого движения мыши" : "until the mouse moves";
+                case "lang_row": return ru ? "Язык: {0}" : "Language: {0}";
+                case "exit_full": return ru ? "Выйти из программы" : "Exit MonitorTray";
+                case "tip_theme": return ru ? "Светлая / тёмная тема" : "Light / dark theme";
+                case "per_monitor": return ru ? "По мониторам" : "Per monitor";
                 case "autostart": return ru ? "Запускать при входе в Windows" : "Start with Windows";
                 case "about": return ru ? "О программе" : "About";
-                case "exit": return ru ? "Выход" : "Exit";
-                case "language": return ru ? "Язык" : "Language";
                 case "tooltip": return ru ? "Мониторы: {0} из {1} вкл." : "Monitors: {0} of {1} on";
                 case "off_done": return ru ? "{0} — выключен" : "{0} — turned off";
                 case "on_done": return ru ? "{0} — включён" : "{0} — turned on";
@@ -1503,41 +1623,1085 @@ namespace MonitorTray
                     ? "MonitorTray уже запущен — значок есть в области уведомлений (возможно, под стрелкой «^»)."
                     : "MonitorTray is already running — the icon is in the notification area (possibly under the \"^\" arrow).";
                 case "about_text": return ru
-                    ? "MonitorTray 1.0\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\n● — монитор включён,  ○ — выключен.\nКлик по монитору в меню переключает его состояние.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
-                    : "MonitorTray 1.0\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\n● — monitor is on,  ○ — off.\nClick a monitor in the menu to toggle it.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
+                    ? "MonitorTray 1.3\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
+                    : "MonitorTray 1.3\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
                 default: return key;
             }
         }
     }
 
-    // ------------------------------------------------------------------ GUI
+    // ------------------------------------------------------------------ стиль
+    // Палитра окна в духе Windows 11 (переключается тёмная/светлая)
+    internal static class Theme
+    {
+        public static Color Bg, Surface, SurfaceHover, Stroke, Divider, Text, TextDim,
+            Accent, AccentText, Track, Hover, Edge, Off;
+
+        public static void Apply(bool dark)
+        {
+            if (dark)
+            {
+                Bg = Color.FromArgb(32, 32, 35); Surface = Color.FromArgb(45, 45, 49);
+                SurfaceHover = Color.FromArgb(52, 52, 57); Stroke = Color.FromArgb(26, 255, 255, 255);
+                Divider = Color.FromArgb(50, 51, 55); Text = Color.FromArgb(242, 242, 245);
+                TextDim = Color.FromArgb(166, 168, 176); Accent = Color.FromArgb(96, 205, 255);
+                AccentText = Color.FromArgb(10, 20, 30); Track = Color.FromArgb(100, 255, 255, 255);
+                Hover = Color.FromArgb(14, 255, 255, 255); Edge = Color.FromArgb(46, 255, 255, 255);
+                Off = Color.FromArgb(120, 122, 128);
+            }
+            else
+            {
+                Bg = Color.FromArgb(243, 244, 248); Surface = Color.FromArgb(252, 252, 254);
+                SurfaceHover = Color.FromArgb(246, 247, 250); Stroke = Color.FromArgb(24, 0, 0, 0);
+                Divider = Color.FromArgb(225, 228, 234); Text = Color.FromArgb(27, 27, 31);
+                TextDim = Color.FromArgb(98, 102, 112); Accent = Color.FromArgb(0, 95, 184);
+                AccentText = Color.White; Track = Color.FromArgb(80, 0, 0, 0);
+                Hover = Color.FromArgb(10, 0, 0, 0); Edge = Color.FromArgb(40, 0, 0, 0);
+                Off = Color.FromArgb(150, 154, 162);
+            }
+        }
+    }
+
+    // Шрифты: Manrope (встроен в exe, сжат gzip) + системный шрифт значков Windows
+    internal static class Fonts
+    {
+        public const int Regular = 0, Medium = 1, SemiBold = 2, Icons = 3;
+        static PrivateFontCollection _pfc;
+        static FontFamily[] _fam = new FontFamily[4];
+        static Dictionary<string, Font> _cache = new Dictionary<string, Font>();
+
+        public static void Load()
+        {
+            try
+            {
+                _pfc = new PrivateFontCollection();
+                Assembly asm = Assembly.GetExecutingAssembly();
+                foreach (string n in asm.GetManifestResourceNames())
+                {
+                    if (!n.EndsWith(".ttf.gz", StringComparison.OrdinalIgnoreCase)) continue;
+                    byte[] data;
+                    using (Stream st = asm.GetManifestResourceStream(n))
+                    using (GZipStream gz = new GZipStream(st, CompressionMode.Decompress))
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        gz.CopyTo(ms);
+                        data = ms.ToArray();
+                    }
+                    IntPtr mem = Marshal.AllocCoTaskMem(data.Length); // живёт до конца процесса
+                    Marshal.Copy(data, 0, mem, data.Length);
+                    _pfc.AddMemoryFont(mem, data.Length);
+                }
+                foreach (FontFamily f in _pfc.Families)
+                {
+                    // семейства встроенных шрифтов переименованы в «<Имя> MT <Начертание>»
+                    if (f.Name.EndsWith(" MT Regular")) _fam[Regular] = f;
+                    else if (f.Name.EndsWith(" MT Medium")) _fam[Medium] = f;
+                    else if (f.Name.EndsWith(" MT SemiBold")) _fam[SemiBold] = f;
+                }
+            }
+            catch { }
+            // запасной вариант — системный Segoe UI
+            if (_fam[Regular] == null) _fam[Regular] = Family("Segoe UI") ?? FontFamily.GenericSansSerif;
+            if (_fam[Medium] == null) _fam[Medium] = _fam[Regular];
+            if (_fam[SemiBold] == null) _fam[SemiBold] = Family("Segoe UI Semibold") ?? _fam[Regular];
+            _fam[Icons] = Family("Segoe Fluent Icons") ?? Family("Segoe MDL2 Assets") ?? _fam[Regular];
+        }
+
+        static FontFamily Family(string name)
+        {
+            try { return new FontFamily(name); } catch { return null; }
+        }
+
+        public static Font Get(int kind, float px)
+        {
+            string key = kind + ":" + px;
+            Font f;
+            if (!_cache.TryGetValue(key, out f))
+            {
+                f = new Font(_fam[kind], px, FontStyle.Regular, GraphicsUnit.Pixel);
+                _cache[key] = f;
+            }
+            return f;
+        }
+    }
+
+    // Сохраняемые настройки интерфейса: тема и раскрытость ползунков по мониторам
+    internal static class Ui
+    {
+        public static bool DarkTheme = false;
+        public static bool SlidersExpanded = false;
+        public static bool SettingsExpanded = true;
+
+        static string UiFile()
+        {
+            return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "MonitorTray_ui.txt");
+        }
+
+        public static void Load()
+        {
+            try
+            {
+                if (System.IO.File.Exists(UiFile()))
+                {
+                    foreach (string line in System.IO.File.ReadAllLines(UiFile()))
+                    {
+                        if (line == "theme=light") DarkTheme = false;
+                        else if (line == "theme=dark") DarkTheme = true;
+                        else if (line == "sliders=1") SlidersExpanded = true;
+                        else if (line == "settings=1") SettingsExpanded = true;
+                        else if (line == "settings=0") SettingsExpanded = false;
+                        else if (line == "sliders=0") SlidersExpanded = false;
+                    }
+                }
+            }
+            catch { }
+            Theme.Apply(DarkTheme);
+        }
+
+        public static void Save()
+        {
+            try
+            {
+                System.IO.File.WriteAllLines(UiFile(), new string[]
+                {
+                    DarkTheme ? "theme=dark" : "theme=light",
+                    SlidersExpanded ? "sliders=1" : "sliders=0",
+                    SettingsExpanded ? "settings=1" : "settings=0"
+                });
+            }
+            catch { }
+        }
+    }
+
+    // WinAPI для полупрозрачного окна (скруглённые углы и тень на Windows 10 и 11)
+    internal static class Layered
+    {
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref Point pptDst, ref Size psize,
+            IntPtr hdcSrc, ref Point pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+        [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+        [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
+        [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObject);
+        [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject);
+        [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+        public static void Push(IntPtr hwnd, Bitmap bmp, Point pos)
+        {
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            IntPtr memDc = CreateCompatibleDC(screenDc);
+            IntPtr hBmp = bmp.GetHbitmap(Color.FromArgb(0));
+            IntPtr old = SelectObject(memDc, hBmp);
+            try
+            {
+                Size size = bmp.Size;
+                Point src = Point.Empty;
+                BLENDFUNCTION blend = new BLENDFUNCTION();
+                blend.BlendOp = 0;               // AC_SRC_OVER
+                blend.SourceConstantAlpha = 255;
+                blend.AlphaFormat = 1;           // AC_SRC_ALPHA
+                UpdateLayeredWindow(hwnd, screenDc, ref pos, ref size, memDc, ref src, 0, ref blend, 2 /*ULW_ALPHA*/);
+            }
+            finally
+            {
+                SelectObject(memDc, old);
+                DeleteObject(hBmp);
+                DeleteDC(memDc);
+                ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
+
+        public static float ScaleAt(Point p)
+        {
+            try
+            {
+                uint dx, dy;
+                IntPtr mon = Native.MonitorFromPoint(p, 2 /*NEAREST*/);
+                if (GetDpiForMonitor(mon, 0 /*EFFECTIVE*/, out dx, out dy) == 0 && dx > 0) return dx / 96f;
+            }
+            catch { }
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96f;
+        }
+    }
+
+    // ------------------------------------------------------------------ GUI: окно
+    // Всплывающее окно у трея. Целиком рисуется вручную (одна картинка с альфа-каналом),
+    // элементы — прямоугольники-«хиты» с обработчиками.
+    internal class Popup : Form
+    {
+        const float W = 372;     // ширина карточки (логические px, 96 dpi)
+        const float SH = 18;     // поле под тень
+        const float PAD = 22;    // внутренний отступ
+        const float IND = 34;    // отступ содержимого секций (под текст заголовка)
+
+        // значки шрифта Segoe MDL2 Assets / Segoe Fluent Icons
+        const string G_MONITOR = "", G_SUN = "", G_GEAR = "", G_MOON = "",
+            G_GLOBE = "", G_INFO = "", G_CLOSE = "", G_CHECK = "",
+            G_DOWN = "", G_UP = "";
+
+        class Hit { public RectangleF R; public string Id; public Action Click; }
+
+        readonly TrayApp _app;
+        readonly List<Hit> _hits = new List<Hit>();
+        readonly Dictionary<string, RectangleF> _tracks = new Dictionary<string, RectangleF>();
+        readonly System.Windows.Forms.Timer _brightTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer _tipTimer = new System.Windows.Forms.Timer();
+        readonly ToolTip _tip = new ToolTip();
+
+        List<Mon> _mons = new List<Mon>();
+        List<BrightEntry> _brights;          // живёт, пока окно открыто
+        int _allValue;
+        bool _auto;
+        bool _langOpen;
+        int _busyIdx = -1;
+        string _hover, _press, _drag;
+
+        float _scale = 1f;
+        float _cardH = 600;
+        Rectangle _wa, _sb;                  // рабочая область и границы экрана у трея
+
+        public bool Busy;                    // идёт переключение монитора — не прятать окно
+        public int HiddenAt;
+
+        static readonly StringFormat FmtL = MakeFmt(StringAlignment.Near);
+        static readonly StringFormat FmtC = MakeFmt(StringAlignment.Center);
+        static readonly StringFormat FmtR = MakeFmt(StringAlignment.Far);
+
+        static StringFormat MakeFmt(StringAlignment a)
+        {
+            StringFormat f = (StringFormat)StringFormat.GenericTypographic.Clone();
+            f.Alignment = a;
+            f.LineAlignment = StringAlignment.Center;
+            f.Trimming = StringTrimming.EllipsisCharacter;
+            f.FormatFlags |= StringFormatFlags.NoWrap;
+            return f;
+        }
+
+        public Popup(TrayApp app)
+        {
+            _app = app;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            KeyPreview = true;
+            Text = "MonitorTray";
+
+            _brightTimer.Interval = 120;
+            _brightTimer.Tick += delegate { _brightTimer.Stop(); FlushBright(); };
+
+            // подсказки к кнопкам в шапке — с обычной для Windows задержкой
+            _tipTimer.Interval = 500;
+            _tipTimer.Tick += delegate
+            {
+                _tipTimer.Stop();
+                string t = _hover == "close" ? Loc.Get("exit_full") : (_hover == "theme" ? Loc.Get("tip_theme") : null);
+                if (t != null && Visible)
+                {
+                    Point c = PointToClient(Cursor.Position);
+                    _tip.Show(t, this, c.X, c.Y + 24, 3000);
+                }
+            };
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x80000 /*WS_EX_LAYERED*/ | 0x80 /*WS_EX_TOOLWINDOW*/;
+                return cp;
+            }
+        }
+
+        // ---------------------------------------------------------------- показ / скрытие
+        public void ShowNearTray()
+        {
+            IntPtr h = Handle; // окно должно существовать до первой отрисовки
+            Reload();
+            AnchorAt(Cursor.Position);
+            Render();
+            Show();
+            Activate();
+            Native.SetForegroundWindow(Handle);
+        }
+
+        public void HidePopup()
+        {
+            if (!Visible) return;
+            _tipTimer.Stop();
+            _tip.Hide(this);
+            Hide();
+            HiddenAt = Environment.TickCount;
+            _brightTimer.Stop();
+            FlushBright();
+            Bright.Close(_brights);
+            _brights = null;
+            _langOpen = false;
+            _hover = _press = _drag = null;
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            if (!Busy) HidePopup();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) HidePopup();
+            base.OnKeyDown(e);
+        }
+
+        void Reload()
+        {
+            _mons = Svc.List();
+            _auto = Autostart.IsEnabled();
+            if (_brights != null) { Bright.Close(_brights); _brights = null; }
+            try { _brights = Bright.Open(); } catch { _brights = new List<BrightEntry>(); }
+            int sum = 0;
+            foreach (BrightEntry b in _brights) { b.Value = Bright.ToPercent(b); sum += b.Value; }
+            _allValue = _brights.Count > 0 ? sum / _brights.Count : 0;
+        }
+
+        // запомнить экран у курсора: масштаб и рабочую область
+        void AnchorAt(Point p)
+        {
+            Screen s = Screen.FromPoint(p);
+            _wa = s.WorkingArea;
+            _sb = s.Bounds;
+            _scale = Layered.ScaleAt(p);
+        }
+
+        void FlushBright()
+        {
+            if (_brights == null) return;
+            foreach (BrightEntry b in _brights)
+            {
+                if (b.Pending.HasValue)
+                {
+                    Bright.Apply(b, b.Pending.Value);
+                    b.Pending = null;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- отрисовка
+        void Render()
+        {
+            // 1-й проход — только узнать высоту
+            using (Bitmap tmp = new Bitmap(1, 1))
+            using (Graphics g = Graphics.FromImage(tmp))
+                _cardH = PaintCard(g);
+
+            // не вылезать за рабочую область на маленьких экранах
+            float scale = _scale;
+            float fit = (_wa.Height - 8) / (_cardH + 2 * SH - 16);
+            if (fit < scale) scale = fit;
+
+            // Содержимое рисуется на непрозрачной подложке: только так GDI+ даёт
+            // ClearType (субпиксельный) текст — он одинаково чёткий в тёмной и светлой теме.
+            int ox = (int)Math.Round(SH * scale);
+            int cw = (int)Math.Ceiling(W * scale), ch = (int)Math.Ceiling(_cardH * scale);
+            int bw = cw + 2 * ox, bh = ch + 2 * ox;
+            using (Bitmap card = new Bitmap(cw, ch, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            using (Bitmap bmp = new Bitmap(bw, bh, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(card))
+                {
+                    g.Clear(Theme.Bg);
+                    g.ScaleTransform(scale, scale);
+                    PaintCard(g);
+                }
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.ScaleTransform(scale, scale);
+                    DrawShadow(g);
+                    // карточка со сглаженными скруглёнными углами, пиксель в пиксель
+                    g.ResetTransform();
+                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    g.PixelOffsetMode = PixelOffsetMode.Half;
+                    RectangleF cr = new RectangleF(ox, ox, cw, ch);
+                    using (TextureBrush tb = new TextureBrush(card, WrapMode.Clamp))
+                    using (GraphicsPath p = Round(cr, 10 * scale))
+                    {
+                        tb.TranslateTransform(ox, ox);
+                        g.FillPath(tb, p);
+                    }
+                    cr.Inflate(-0.5f, -0.5f);
+                    using (GraphicsPath p = Round(cr, 10 * scale))
+                    using (Pen pen = new Pen(Theme.Edge, 1f)) g.DrawPath(pen, p);
+                }
+                _drawScale = scale;
+                Layered.Push(Handle, bmp, Place(bw, bh, scale));
+            }
+        }
+        float _drawScale = 1f;
+
+        Point Place(int bw, int bh, float scale)
+        {
+            int gap = (int)((SH - 10) * scale); // тень может заходить за край, карточка — в 10 px от него
+            bool left = _wa.Left > _sb.Left, top = _wa.Top > _sb.Top;
+            int x = left ? _wa.Left - gap : _wa.Right - bw + gap;
+            int y = top ? _wa.Top - gap : _wa.Bottom - bh + gap;
+            return new Point(x, y);
+        }
+
+        // мягкая тень под карточкой
+        void DrawShadow(Graphics g)
+        {
+            RectangleF card = new RectangleF(SH, SH, W, _cardH);
+            int maxA = Ui.DarkTheme ? 9 : 5;
+            for (int i = (int)SH; i >= 1; i--)
+            {
+                float k = 1f - i / SH;
+                RectangleF r = card;
+                r.Inflate(i, i);
+                r.Offset(0, 4);
+                using (GraphicsPath p = Round(r, 10 + i))
+                using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(maxA * k * k), 0, 0, 0)))
+                    g.FillPath(b, p);
+            }
+        }
+
+        // содержимое карточки; возвращает её высоту
+        float PaintCard(Graphics g)
+        {
+            _hits.Clear();
+            _tracks.Clear();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            float x0 = PAD, x1 = W - PAD, cx = x0 + IND;
+            float y = 10;
+
+            // --- верхняя строка: название, кнопка темы и крестик (выход из программы;
+            //     просто спрятать окно — клик мимо него или Esc)
+            RectangleF rClose = new RectangleF(W - 10 - 34, y, 34, 30);
+            RectangleF rTheme = new RectangleF(rClose.X - 36, y, 34, 30);
+            Add("theme", rTheme, ToggleTheme);
+            Add("close", rClose, delegate { _app.ExitApp(); });
+            if (_hover == "theme") Fill(g, rTheme, 6, Theme.Hover);
+            if (_hover == "close") Fill(g, rClose, 6, Color.FromArgb(196, 43, 28)); // красный, как у Windows
+            Glyph(g, Ui.DarkTheme ? G_SUN : G_MOON, 14, Theme.TextDim, rTheme);
+            Glyph(g, G_CLOSE, 11, _hover == "close" ? Color.White : Theme.TextDim, rClose);
+            DrawText(g, "MonitorTray", Fonts.Get(Fonts.Medium, 12), Theme.TextDim, new RectangleF(x0, y, 150, 30), FmtL);
+            y += 34;
+
+            // --- мониторы
+            int active = 0;
+            foreach (Mon m in _mons) if (m.Active) active++;
+            y = Section(g, G_MONITOR, Loc.Get("sec_monitors"), y,
+                _mons.Count > 0 ? string.Format(Loc.Get("count_on"), active, _mons.Count) : null);
+            if (_mons.Count == 0)
+            {
+                DrawText(g, Loc.Get("no_monitors"), Fonts.Get(Fonts.Regular, 13.5f), Theme.TextDim, new RectangleF(cx, y, x1 - cx, 36), FmtL);
+                y += 36;
+            }
+            for (int i = 0; i < _mons.Count; i++)
+            {
+                y = MonitorRow(g, i, cx, x1, y);
+            }
+            y = Divider(g, y + 8);
+
+            // --- яркость (DDC/CI), если мониторы поддерживают
+            if (_brights != null && _brights.Count > 0)
+            {
+                float sy = y;
+                y = Section(g, G_SUN, Loc.Get("sec_bright"), y, null);
+                if (_brights.Count == 1)
+                {
+                    y = Slider(g, "b0", BrightName(_brights[0]), _brights[0].Value, cx, x1, y);
+                }
+                else
+                {
+                    // кнопка «По мониторам»: показать/скрыть ползунки каждого монитора (как в Twinkle Tray)
+                    bool ex = Ui.SlidersExpanded;
+                    Font fp = Fonts.Get(Fonts.Medium, 12);
+                    string pl = Loc.Get("per_monitor");
+                    float pw = g.MeasureString(pl, fp, PointF.Empty, FmtL).Width + 40;
+                    RectangleF rp = new RectangleF(x1 + 6 - pw, sy + 4, pw, 26);
+                    Add("split", rp, ToggleSplit);
+                    Color pc = ex ? Theme.Accent : Theme.TextDim;
+                    if (ex) Fill(g, rp, 13, Color.FromArgb(Ui.DarkTheme ? 40 : 24, Theme.Accent));
+                    else
+                        using (GraphicsPath p = Round(rp, 13))
+                        using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+                    if (_hover == "split") Fill(g, rp, 13, Theme.Hover);
+                    DrawText(g, pl, fp, pc, new RectangleF(rp.X + 12, rp.Y, pw - 34, rp.Height), FmtL);
+                    Glyph(g, ex ? G_UP : G_DOWN, 9, pc, new RectangleF(rp.Right - 26, rp.Y, 20, rp.Height));
+
+                    y = Slider(g, "all", Loc.Get("bright_all"), _allValue, cx, x1, y);
+                    if (ex)
+                        for (int i = 0; i < _brights.Count; i++)
+                            y = Slider(g, "b" + i, BrightName(_brights[i]), _brights[i].Value, cx, x1, y);
+                }
+                y = Divider(g, y + 8);
+            }
+
+            // --- действия и настройки: клик по заголовку сворачивает / разворачивает раздел
+            bool sx = Ui.SettingsExpanded;
+            RectangleF rh = new RectangleF(x0 - 10, y, x1 - x0 + 16, 34);
+            Add("settings", rh, ToggleSettings);
+            if (_hover == "settings") Fill(g, rh, 6, Theme.Hover);
+            Glyph(g, sx ? G_UP : G_DOWN, 11, Theme.TextDim, new RectangleF(x1 - 26, y, 26, 34));
+            y = Section(g, G_GEAR, Loc.Get("sec_actions"), y, null);
+            if (!sx) return y + 6;
+
+            // погасить все экраны — кнопка-карточка
+            RectangleF rs = new RectangleF(x0, y, x1 - x0, 60);
+            Add("sleep", rs, SleepAll);
+            Card(g, rs, _hover == "sleep");
+            Glyph(g, G_MOON, 19, Theme.Accent, new RectangleF(rs.X + 6, rs.Y, 44, rs.Height));
+            DrawText(g, Loc.Get("sleep_title"), Fonts.Get(Fonts.Medium, 14), Theme.Text, new RectangleF(rs.X + 52, rs.Y + 10, rs.Width - 64, 21), FmtL);
+            DrawText(g, Loc.Get("sleep_hint"), Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim, new RectangleF(rs.X + 52, rs.Y + 31, rs.Width - 64, 18), FmtL);
+            y += rs.Height + 6;
+
+            // автозапуск — флажок
+            RectangleF ra = new RectangleF(x0, y, x1 - x0, 40);
+            Add("auto", ra, ToggleAuto);
+            if (_hover == "auto") Fill(g, ra, 6, Theme.Hover);
+            RectangleF box = new RectangleF(x0 + 12, ra.Y + 10, 20, 20);
+            if (_auto)
+            {
+                Fill(g, box, 4, Theme.Accent);
+                Glyph(g, G_CHECK, 12, Theme.AccentText, box);
+            }
+            else
+            {
+                using (GraphicsPath p = Round(box, 4))
+                using (Pen pen = new Pen(Theme.TextDim, 1.2f)) g.DrawPath(pen, p);
+            }
+            DrawText(g, Loc.Get("autostart"), Fonts.Get(Fonts.Regular, 13.5f), Theme.Text, new RectangleF(x0 + 44, ra.Y, ra.Width - 50, ra.Height), FmtL);
+            y += ra.Height + 6;
+
+            // язык — выпадающий список (раскрывается прямо в окне)
+            y = LanguageBox(g, x0, x1, y);
+
+            // о программе — ссылка
+            Font fl = Fonts.Get(Fonts.Medium, 13.5f);
+            float lw = g.MeasureString(Loc.Get("about"), fl, PointF.Empty, FmtL).Width;
+            RectangleF rl = new RectangleF(x0 + 4, y + 2, 40 + lw + 8, 34);
+            Add("about", rl, ShowAbout);
+            Color lc = _hover == "about" ? Blend(Theme.Accent, Theme.Text, 0.25f) : Theme.Accent;
+            Glyph(g, G_INFO, 16, lc, new RectangleF(rl.X, rl.Y, 36, rl.Height));
+            DrawText(g, Loc.Get("about"), fl, lc, new RectangleF(rl.X + 40, rl.Y, lw + 6, rl.Height), FmtL);
+            if (_hover == "about")
+                using (Pen pen = new Pen(lc, 1f)) g.DrawLine(pen, rl.X + 40, rl.Y + 25, rl.X + 40 + lw, rl.Y + 25);
+            y += 40;
+            return y + 10;
+        }
+
+        float Section(Graphics g, string glyph, string title, float y, string right)
+        {
+            if (glyph == G_MONITOR) MonitorIcon(g, new RectangleF(PAD - 1, y + 7, 24, 21), -1, true);
+            else Glyph(g, glyph, 18, Theme.Accent, new RectangleF(PAD - 4, y, 30, 34));
+            DrawText(g, title, Fonts.Get(Fonts.SemiBold, 15.5f), Theme.Text, new RectangleF(PAD + IND, y, W - 2 * PAD - IND - 90, 34), FmtL);
+            if (right != null)
+                DrawText(g, right, Fonts.Get(Fonts.Regular, 12), Theme.TextDim, new RectangleF(W - PAD - 120, y, 120, 34), FmtR);
+            return y + 38;
+        }
+
+        float Divider(Graphics g, float y)
+        {
+            using (Pen p = new Pen(Theme.Divider, 1f)) g.DrawLine(p, 1, y, W - 1, y);
+            return y + 14;
+        }
+
+        float MonitorRow(Graphics g, int i, float cx, float x1, float y)
+        {
+            Mon m = _mons[i];
+            string id = "mon" + i;
+            bool busy = _busyIdx == i;
+            RectangleF row = new RectangleF(cx - 10, y, x1 - cx + 14, 42);
+            int idx = i;
+            Add(id, row, delegate { ToggleMonitor(idx); });
+            if (_hover == id) Fill(g, row, 6, Theme.Hover);
+
+            MonitorIcon(g, new RectangleF(cx - 2, y + 9, 27, 23), i, m.Active);
+
+            // имя + метка («Основной» / «Выключен»)
+            float sw = 46;                       // переключатель справа
+            float nx = cx + 34, maxW = x1 - sw - 10 - nx;
+            Font fn = Fonts.Get(Fonts.Regular, 14);
+            Font fb = Fonts.Get(Fonts.Medium, 11);
+            string badge = !m.Active ? Loc.Get("badge_off") : (m.Primary ? Loc.Get("badge_primary") : null);
+            float bwid = badge != null ? g.MeasureString(badge, fb, PointF.Empty, FmtL).Width + 16 : 0;
+            float tw = g.MeasureString(m.Name, fn, PointF.Empty, FmtL).Width + 2;
+            float nameW = Math.Min(tw, maxW - (badge != null ? bwid + 8 : 0));
+            DrawText(g, m.Name, fn, m.Active ? Theme.Text : Theme.TextDim, new RectangleF(nx, y, nameW, row.Height), FmtL);
+            if (badge != null)
+            {
+                RectangleF rb = new RectangleF(nx + nameW + 8, y + row.Height / 2 - 10, bwid, 20);
+                Color bc = m.Active ? Theme.Accent : Theme.Off;
+                Fill(g, rb, 10, Color.FromArgb(Ui.DarkTheme ? 40 : 26, bc));
+                DrawText(g, badge, fb, bc, rb, FmtC);
+            }
+
+            // переключатель Windows 11
+            RectangleF ts = new RectangleF(x1 - sw + 6, y + row.Height / 2 - 10, 40, 20);
+            bool on = m.Active;
+            bool hov = _hover == id;
+            if (busy)
+            {
+                using (GraphicsPath p = Round(ts, 10))
+                using (Pen pen = new Pen(Theme.TextDim, 1f)) g.DrawPath(pen, p);
+                float d = 10;
+                using (SolidBrush b = new SolidBrush(Theme.TextDim))
+                    g.FillEllipse(b, ts.X + ts.Width / 2 - d / 2, ts.Y + 5, d, d);
+            }
+            else if (on)
+            {
+                Fill(g, ts, 10, Theme.Accent);
+                float d = hov ? 14 : 12;
+                using (SolidBrush b = new SolidBrush(Theme.AccentText))
+                    g.FillEllipse(b, ts.Right - 10 - d / 2, ts.Y + 10 - d / 2, d, d);
+            }
+            else
+            {
+                using (GraphicsPath p = Round(ts, 10))
+                using (Pen pen = new Pen(Theme.TextDim, 1f)) g.DrawPath(pen, p);
+                float d = hov ? 12 : 10;
+                using (SolidBrush b = new SolidBrush(Theme.TextDim))
+                    g.FillEllipse(b, ts.X + 10 - d / 2, ts.Y + 10 - d / 2, d, d);
+            }
+            return y + row.Height + 2;
+        }
+
+        float Slider(Graphics g, string id, string label, int value, float cx, float x1, float y)
+        {
+            DrawText(g, label, Fonts.Get(Fonts.Regular, 13), Theme.Text, new RectangleF(cx, y, x1 - cx, 20), FmtL);
+            y += 20;
+            float vw = 48;
+            RectangleF track = new RectangleF(cx + 2, y + 15, x1 - vw - cx - 10, 0);
+            _tracks[id] = track;
+            Add("s:" + id, new RectangleF(cx - 8, y, x1 - vw - cx + 8, 30), null);
+            bool act = _hover == "s:" + id || _drag == id;
+
+            float tx = track.X + track.Width * value / 100f;
+            using (Pen p = new Pen(Theme.Track, 4f))
+            {
+                p.StartCap = p.EndCap = LineCap.Round;
+                g.DrawLine(p, tx, track.Y, track.Right, track.Y);
+            }
+            using (Pen p = new Pen(Theme.Accent, 4f))
+            {
+                p.StartCap = p.EndCap = LineCap.Round;
+                g.DrawLine(p, track.X, track.Y, tx, track.Y);
+            }
+            // бегунок: светлое кольцо + точка акцентного цвета
+            float R = 10;
+            using (SolidBrush b = new SolidBrush(Theme.Surface)) g.FillEllipse(b, tx - R, track.Y - R, 2 * R, 2 * R);
+            using (Pen p = new Pen(Theme.Stroke, 1f)) g.DrawEllipse(p, tx - R, track.Y - R, 2 * R, 2 * R);
+            float r = _drag == id ? 5f : (act ? 7f : 6f);
+            using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillEllipse(b, tx - r, track.Y - r, 2 * r, 2 * r);
+
+            DrawText(g, value + "%", Fonts.Get(Fonts.Medium, 13), Theme.Text, new RectangleF(x1 - vw, y, vw, 30), FmtR);
+            return y + 34;
+        }
+
+        float LanguageBox(Graphics g, float x0, float x1, float y)
+        {
+            float hh = 44, oh = 36;
+            float h = hh + (_langOpen ? 2 * oh + 6 : 0);
+            RectangleF card = new RectangleF(x0, y, x1 - x0, h);
+            RectangleF head = new RectangleF(x0, y, x1 - x0, hh);
+            Add("lang", head, delegate { _langOpen = !_langOpen; Render(); });
+            Card(g, card, false);
+            if (_hover == "lang")
+                using (GraphicsPath p = Round(head, 6))
+                using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillPath(b, p);
+
+            string cur = Loc.Lang == "ru" ? "Русский" : "English";
+            Glyph(g, G_GLOBE, 16, Theme.TextDim, new RectangleF(x0 + 6, y, 40, hh));
+            DrawText(g, string.Format(Loc.Get("lang_row"), cur), Fonts.Get(Fonts.Regular, 13.5f), Theme.Text,
+                new RectangleF(x0 + 46, y, head.Width - 90, hh), FmtL);
+            Glyph(g, _langOpen ? G_UP : G_DOWN, 11, Theme.TextDim, new RectangleF(x1 - 40, y, 32, hh));
+
+            if (_langOpen)
+            {
+                using (Pen p = new Pen(Theme.Divider, 1f)) g.DrawLine(p, x0 + 1, y + hh, x1 - 1, y + hh);
+                string[] codes = { "en", "ru" };
+                string[] names = { "English", "Русский" };
+                float oy = y + hh + 3;
+                for (int k = 0; k < 2; k++)
+                {
+                    string code = codes[k];
+                    RectangleF ro = new RectangleF(x0 + 4, oy, x1 - x0 - 8, oh);
+                    Add("lang_" + code, ro, delegate { SetLang(code); });
+                    if (_hover == "lang_" + code) Fill(g, ro, 5, Theme.Hover);
+                    if (Loc.Lang == code)
+                    {
+                        Fill(g, new RectangleF(ro.X + 2, ro.Y + 10, 3, ro.Height - 20), 1.5f, Theme.Accent);
+                        Glyph(g, G_CHECK, 12, Theme.Accent, new RectangleF(x1 - 40, oy, 32, oh));
+                    }
+                    DrawText(g, names[k], Fonts.Get(Loc.Lang == code ? Fonts.Medium : Fonts.Regular, 13.5f), Theme.Text,
+                        new RectangleF(x0 + 42, oy, 200, oh), FmtL);
+                    oy += oh;
+                }
+            }
+            return y + h + 2;
+        }
+
+        string BrightName(BrightEntry b)
+        {
+            foreach (Mon m in _mons) if (m.GdiName == b.Gdi) return m.Name;
+            return b.Gdi;
+        }
+
+        // Цветной значок монитора: рамка, экран с «обоями» в духе Windows 11 и подставка.
+        // palette: -1 — значок заголовка, 0.. — по номеру монитора; выключенный — тёмный экран.
+        static readonly Color[][] Wallpapers = new Color[][]
+        {
+            new Color[] { Color.FromArgb(92, 192, 255), Color.FromArgb(0, 103, 214), Color.FromArgb(0, 38, 118), Color.FromArgb(175, 228, 255) },
+            new Color[] { Color.FromArgb(255, 214, 92), Color.FromArgb(247, 108, 48), Color.FromArgb(186, 28, 72), Color.FromArgb(255, 236, 170) },
+            new Color[] { Color.FromArgb(124, 236, 200), Color.FromArgb(0, 168, 140), Color.FromArgb(0, 78, 92), Color.FromArgb(205, 255, 236) },
+            new Color[] { Color.FromArgb(212, 164, 255), Color.FromArgb(128, 78, 230), Color.FromArgb(58, 30, 140), Color.FromArgb(236, 214, 255) },
+        };
+        static readonly Color[] HeaderWallpaper =
+            { Color.FromArgb(150, 232, 255), Color.FromArgb(38, 170, 240), Color.FromArgb(8, 96, 188), Color.FromArgb(215, 245, 255) };
+
+        internal static void MonitorIcon(Graphics g, RectangleF r, int palette, bool on)
+        {
+            float w = r.Width, cx = r.X + w / 2;
+            float bodyH = r.Height * 0.78f;
+            RectangleF body = new RectangleF(r.X, r.Y, w, bodyH);
+            Color bezel = Ui.DarkTheme ? Color.FromArgb(14, 15, 18) : Color.FromArgb(36, 40, 48);
+
+            // подставка
+            using (SolidBrush b = new SolidBrush(bezel))
+            {
+                float nw = w * 0.17f;
+                g.FillRectangle(b, cx - nw / 2, body.Bottom - 0.5f, nw, r.Height * 0.13f + 0.5f);
+            }
+            Fill(g, new RectangleF(cx - w * 0.26f, r.Bottom - r.Height * 0.1f, w * 0.52f, r.Height * 0.1f), 1f, bezel);
+
+            // корпус
+            Fill(g, body, 2.6f, bezel);
+            if (Ui.DarkTheme)
+                using (GraphicsPath p = Round(body, 2.6f))
+                using (Pen pen = new Pen(Color.FromArgb(52, 255, 255, 255), 0.8f)) g.DrawPath(pen, p);
+
+            // экран
+            float b0 = Math.Max(1.4f, w * 0.06f);
+            RectangleF scr = new RectangleF(body.X + b0, body.Y + b0, body.Width - 2 * b0, body.Height - b0 * 2.2f);
+            using (GraphicsPath sp = Round(scr, 1.2f))
+            {
+                GraphicsState st = g.Save();
+                g.SetClip(sp);
+                RectangleF gr = RectangleF.Inflate(scr, 1, 1);
+                if (on)
+                {
+                    Color[] c = palette < 0 ? HeaderWallpaper : Wallpapers[palette % Wallpapers.Length];
+                    using (LinearGradientBrush lb = new LinearGradientBrush(gr, c[0], c[2], 35f))
+                    {
+                        ColorBlend cb = new ColorBlend(3);
+                        cb.Colors = new Color[] { c[0], c[1], c[2] };
+                        cb.Positions = new float[] { 0f, 0.5f, 1f };
+                        lb.InterpolationColors = cb;
+                        g.FillRectangle(lb, gr);
+                    }
+                    // «лепесток» как на обоях Windows 11
+                    using (SolidBrush sb = new SolidBrush(Color.FromArgb(150, c[3])))
+                        g.FillEllipse(sb, scr.X + scr.Width * 0.22f, scr.Y + scr.Height * 0.38f, scr.Width * 1.25f, scr.Height * 1.5f);
+                    using (SolidBrush sb = new SolidBrush(Color.FromArgb(200, c[1])))
+                        g.FillEllipse(sb, scr.X + scr.Width * 0.42f, scr.Y + scr.Height * 0.62f, scr.Width * 1.1f, scr.Height * 1.3f);
+                    using (Pen pp = new Pen(Color.FromArgb(150, 255, 255, 255), Math.Max(0.8f, w * 0.04f)))
+                        g.DrawEllipse(pp, scr.X + scr.Width * 0.3f, scr.Y + scr.Height * 0.5f, scr.Width * 1.2f, scr.Height * 1.4f);
+                }
+                else
+                {
+                    using (LinearGradientBrush lb = new LinearGradientBrush(gr, Color.FromArgb(70, 74, 82), Color.FromArgb(26, 28, 32), 35f))
+                        g.FillRectangle(lb, gr);
+                }
+                // блик стекла
+                using (GraphicsPath gl = new GraphicsPath())
+                {
+                    gl.AddPolygon(new PointF[] {
+                        new PointF(scr.X, scr.Y), new PointF(scr.X + scr.Width * 0.55f, scr.Y),
+                        new PointF(scr.X, scr.Y + scr.Height * 0.75f) });
+                    using (SolidBrush sb = new SolidBrush(Color.FromArgb(on ? 34 : 22, 255, 255, 255))) g.FillPath(sb, gl);
+                }
+                g.Restore(st);
+            }
+        }
+
+        // ---------------------------------------------------------------- примитивы
+        Hit Add(string id, RectangleF r, Action click)
+        {
+            Hit h = new Hit();
+            h.Id = id; h.R = r; h.Click = click;
+            _hits.Add(h);
+            return h;
+        }
+
+        void Card(Graphics g, RectangleF r, bool hover)
+        {
+            using (GraphicsPath p = Round(r, 7))
+            {
+                using (SolidBrush b = new SolidBrush(hover ? Theme.SurfaceHover : Theme.Surface)) g.FillPath(b, p);
+                using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+            }
+        }
+
+        static void Fill(Graphics g, RectangleF r, float rad, Color c)
+        {
+            using (GraphicsPath p = Round(r, rad))
+            using (SolidBrush b = new SolidBrush(c)) g.FillPath(b, p);
+        }
+
+        static void DrawText(Graphics g, string s, Font f, Color c, RectangleF r, StringFormat fmt)
+        {
+            using (SolidBrush b = new SolidBrush(c)) g.DrawString(s, f, b, r, fmt);
+        }
+
+        static void Glyph(Graphics g, string glyph, float px, Color c, RectangleF r)
+        {
+            // значки — без субпиксельного сглаживания, иначе на тонких линиях цветная кайма
+            TextRenderingHint old = g.TextRenderingHint;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            using (SolidBrush b = new SolidBrush(c)) g.DrawString(glyph, Fonts.Get(Fonts.Icons, px), b, r, FmtC);
+            g.TextRenderingHint = old;
+        }
+
+        static Color Blend(Color a, Color b, float t)
+        {
+            return Color.FromArgb(255, (int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+        }
+
+        static GraphicsPath Round(RectangleF r, float rad)
+        {
+            GraphicsPath p = new GraphicsPath();
+            float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
+            if (d <= 0.5f) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // ---------------------------------------------------------------- мышь
+        PointF ToCard(Point p) { return new PointF(p.X / _drawScale - SH, p.Y / _drawScale - SH); }
+
+        Hit HitAt(PointF p)
+        {
+            for (int i = _hits.Count - 1; i >= 0; i--) if (_hits[i].R.Contains(p)) return _hits[i];
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            PointF p = ToCard(e.Location);
+            if (_drag != null) { SetSlider(_drag, p.X); Render(); return; }
+            Hit h = HitAt(p);
+            string id = h != null ? h.Id : null;
+            Cursor = h != null ? Cursors.Hand : Cursors.Default;
+            if (id != _hover)
+            {
+                _hover = id;
+                _tip.Hide(this);
+                _tipTimer.Stop();
+                if (id == "close" || id == "theme") _tipTimer.Start();
+                Render();
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            _tipTimer.Stop();
+            if (_drag == null && _hover != null) { _hover = null; Render(); }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            PointF p = ToCard(e.Location);
+            Hit h = HitAt(p);
+            if (h == null) return;
+            if (h.Id.StartsWith("s:"))
+            {
+                _drag = h.Id.Substring(2);
+                Capture = true;
+                SetSlider(_drag, p.X);
+                Render();
+                return;
+            }
+            _press = h.Id;
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (_drag != null) { _drag = null; Capture = false; Render(); return; }
+            Hit h = HitAt(ToCard(e.Location));
+            string pressed = _press;
+            _press = null;
+            if (h != null && h.Id == pressed && h.Click != null) h.Click();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            Hit h = HitAt(ToCard(PointToClient(Cursor.Position)));
+            if (h == null || !h.Id.StartsWith("s:")) return;
+            string id = h.Id.Substring(2);
+            int v = (id == "all" ? _allValue : _brights[int.Parse(id.Substring(1))].Value) + (e.Delta > 0 ? 5 : -5);
+            SetValue(id, v);
+            Render();
+        }
+
+        void SetSlider(string id, float x)
+        {
+            RectangleF t;
+            if (!_tracks.TryGetValue(id, out t) || t.Width <= 0) return;
+            SetValue(id, (int)Math.Round((x - t.X) / t.Width * 100));
+        }
+
+        void SetValue(string id, int v)
+        {
+            if (_brights == null || _brights.Count == 0) return;
+            v = Math.Max(0, Math.Min(100, v));
+            if (id == "all")
+            {
+                _allValue = v;
+                foreach (BrightEntry b in _brights) { b.Value = v; b.Pending = v; }
+            }
+            else
+            {
+                BrightEntry b = _brights[int.Parse(id.Substring(1))];
+                b.Value = v; b.Pending = v;
+                int sum = 0;
+                foreach (BrightEntry bb in _brights) sum += bb.Value;
+                _allValue = sum / _brights.Count;
+            }
+            _brightTimer.Stop();
+            _brightTimer.Start(); // применить отложенно, чтобы не заспамить DDC
+        }
+
+        // ---------------------------------------------------------------- действия
+        void ToggleTheme()
+        {
+            Ui.DarkTheme = !Ui.DarkTheme;
+            Theme.Apply(Ui.DarkTheme);
+            Ui.Save();
+            _app.RefreshIcon();
+            Render();
+        }
+
+        void ToggleSettings()
+        {
+            Ui.SettingsExpanded = !Ui.SettingsExpanded;
+            _langOpen = false;
+            Ui.Save();
+            Render();
+        }
+
+        void ToggleSplit()
+        {
+            Ui.SlidersExpanded = !Ui.SlidersExpanded;
+            Ui.Save();
+            Render();
+        }
+
+        void ToggleAuto()
+        {
+            try { Autostart.Set(!_auto); } catch { }
+            _auto = Autostart.IsEnabled();
+            Render();
+        }
+
+        void SetLang(string code)
+        {
+            Loc.Set(code);
+            _app.UpdateTooltip();
+            _langOpen = false;
+            Render();
+        }
+
+        void ToggleMonitor(int i)
+        {
+            if (_busyIdx >= 0 || i >= _mons.Count) return;
+            Mon m = _mons[i];
+            _busyIdx = i;
+            Render();
+            BeginInvoke((MethodInvoker)delegate
+            {
+                Busy = true;
+                try { _app.Toggle(m); }
+                finally { Busy = false; _busyIdx = -1; }
+                if (!Visible) return;
+                Reload();
+                AnchorAt(Cursor.Position); // раскладка экранов могла измениться
+                Render();
+                Activate();
+                Native.SetForegroundWindow(Handle);
+            });
+        }
+
+        void SleepAll()
+        {
+            HidePopup();
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+            t.Interval = 400; // дать окну исчезнуть и мыши успокоиться
+            t.Tick += delegate { t.Stop(); t.Dispose(); Native.DpmsOffAll(); };
+            t.Start();
+        }
+
+        void ShowAbout()
+        {
+            HidePopup();
+            MessageBox.Show(Loc.Get("about_text"), Loc.Get("about"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    // ------------------------------------------------------------------ GUI: трей
     internal class TrayApp : ApplicationContext
     {
-        NotifyIcon _icon;
-        ContextMenuStrip _menu;
-        Form _hidden;
+        internal NotifyIcon _icon;
         Icon _appIcon;
+        Popup _popup;
 
         public TrayApp()
         {
-            _hidden = new Form();
-            _hidden.ShowInTaskbar = false;
-
-            _appIcon = AppIcon.Create();
-            _menu = new ContextMenuStrip();
-            _menu.Opening += new System.ComponentModel.CancelEventHandler(MenuOpening);
+            _appIcon = AppIcon.Create(Ui.DarkTheme);
+            _popup = new Popup(this);
 
             _icon = new NotifyIcon();
             _icon.Icon = _appIcon;
             _icon.Text = Loc.Get("tray_title");
             _icon.Visible = true;
-            _icon.ContextMenuStrip = _menu;
             _icon.MouseUp += new MouseEventHandler(IconMouseUp);
+
+            // смена масштаба экрана — перерисовать значок под новый размер
+            SystemEvents.DisplaySettingsChanged += OnSystemChanged;
 
             UpdateTooltip();
         }
 
-        void UpdateTooltip()
+        void OnSystemChanged(object sender, EventArgs e) { RefreshIcon(); }
+
+        // перерисовать значок трея (после смены темы программы или масштаба)
+        internal void RefreshIcon()
+        {
+            Icon old = _appIcon;
+            _appIcon = AppIcon.Create(Ui.DarkTheme);
+            _icon.Icon = _appIcon;
+            old.Dispose();
+        }
+
+        internal void UpdateTooltip()
         {
             try
             {
@@ -1551,105 +2715,16 @@ namespace MonitorTray
             catch { }
         }
 
-        void MenuOpening(object sender, System.ComponentModel.CancelEventArgs e)
-        {
-            Rebuild();
-        }
-
         void IconMouseUp(object sender, MouseEventArgs e)
         {
-            if (e.Button == MouseButtons.Left)
-            {
-                Rebuild();
-                Native.SetForegroundWindow(_hidden.Handle);
-                _menu.Show(Cursor.Position);
-            }
+            if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
+            if (_popup.Visible) { _popup.HidePopup(); return; }
+            // это же нажатие только что закрыло окно (оно теряет фокус раньше, чем приходит MouseUp)
+            if (unchecked(Environment.TickCount - _popup.HiddenAt) < 300) return;
+            _popup.ShowNearTray();
         }
 
-        void Rebuild()
-        {
-            _menu.Items.Clear();
-            List<Mon> mons = Svc.List();
-            int activeCount = 0;
-            foreach (Mon m in mons) if (m.Active) activeCount++;
-
-            ToolStripMenuItem title = new ToolStripMenuItem(string.Format(Loc.Get("menu_title"), activeCount));
-            title.Font = new Font(SystemFonts.MenuFont, FontStyle.Bold);
-            title.Enabled = false;
-            _menu.Items.Add(title);
-            _menu.Items.Add(new ToolStripSeparator());
-
-            if (mons.Count == 0)
-            {
-                ToolStripMenuItem empty = new ToolStripMenuItem(Loc.Get("no_monitors"));
-                empty.Enabled = false;
-                _menu.Items.Add(empty);
-            }
-
-            foreach (Mon m in mons)
-            {
-                ToolStripMenuItem it = new ToolStripMenuItem();
-                if (m.Active)
-                {
-                    it.Text = "●  " + m.Name + (m.Primary ? Loc.Get("primary") : "");
-                    it.ToolTipText = Loc.Get("tip_off") +
-                        (m.GdiName.Length > 0 ? "  (" + m.GdiName + ")" : "");
-                }
-                else
-                {
-                    it.Text = "○  " + m.Name + Loc.Get("turn_on");
-                    it.ForeColor = Color.FromArgb(226, 120, 16);
-                    it.ToolTipText = Loc.Get("tip_on");
-                }
-                if (!m.Bounds.IsEmpty)
-                    it.ToolTipText += "\n" + m.Bounds.Width + "×" + m.Bounds.Height;
-                Mon captured = m;
-                it.Click += delegate(object s2, EventArgs e2) { Toggle(captured); };
-                _menu.Items.Add(it);
-            }
-
-            _menu.Items.Add(new ToolStripSeparator());
-            _menu.Items.Add(MakeItem(Loc.Get("dpms"), delegate { Native.DpmsOffAll(); }));
-
-            // переключение языка
-            ToolStripMenuItem langMenu = new ToolStripMenuItem(Loc.Get("language"));
-            ToolStripMenuItem langEn = new ToolStripMenuItem("English");
-            langEn.Checked = Loc.Lang == "en";
-            langEn.Click += delegate { Loc.Set("en"); UpdateTooltip(); Rebuild(); };
-            ToolStripMenuItem langRu = new ToolStripMenuItem("Русский");
-            langRu.Checked = Loc.Lang == "ru";
-            langRu.Click += delegate { Loc.Set("ru"); UpdateTooltip(); Rebuild(); };
-            langMenu.DropDownItems.Add(langEn);
-            langMenu.DropDownItems.Add(langRu);
-            _menu.Items.Add(langMenu);
-
-            _menu.Items.Add(new ToolStripSeparator());
-            ToolStripMenuItem auto = new ToolStripMenuItem(Loc.Get("autostart"));
-            auto.Checked = Autostart.IsEnabled();
-            auto.Click += delegate
-            {
-                Autostart.Set(!Autostart.IsEnabled());
-                Rebuild();
-            };
-            _menu.Items.Add(auto);
-
-            _menu.Items.Add(MakeItem(Loc.Get("about"), delegate
-            {
-                MessageBox.Show(Loc.Get("about_text"),
-                    Loc.Get("about"), MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }));
-
-            _menu.Items.Add(MakeItem(Loc.Get("exit"), delegate { ExitApp(); }));
-        }
-
-        ToolStripMenuItem MakeItem(string text, EventHandler onClick)
-        {
-            ToolStripMenuItem it = new ToolStripMenuItem(text);
-            it.Click += onClick;
-            return it;
-        }
-
-        void Toggle(Mon m)
+        internal void Toggle(Mon m)
         {
             int hr;
             if (m.Active)
@@ -1672,8 +2747,10 @@ namespace MonitorTray
             UpdateTooltip();
         }
 
-        void ExitApp()
+        internal void ExitApp()
         {
+            _popup.HidePopup();
+            SystemEvents.DisplaySettingsChanged -= OnSystemChanged;
             _icon.Visible = false;
             _icon.Dispose();
             _appIcon.Dispose();
@@ -1699,6 +2776,18 @@ namespace MonitorTray
             }
 
             if (cmd == "dpms-off") { Native.DpmsOffAll(); Console.WriteLine("dpms-off sent"); return 0; }
+
+            if (cmd == "bright")
+            {
+                List<BrightEntry> bs = Bright.Open();
+                if (bs.Count == 0) Console.WriteLine("no DDC-capable monitors");
+                foreach (BrightEntry e in bs)
+                {
+                    Console.WriteLine(e.Gdi + ": " + Bright.ToPercent(e) + "%  (raw " + e.Min + ".." + e.Cur + ".." + e.Max + ")");
+                }
+                Bright.Close(bs);
+                return 0;
+            }
 
             if (cmd == "dbg")
             {
@@ -1775,7 +2864,7 @@ namespace MonitorTray
 
         static void Usage()
         {
-            Console.WriteLine("Usage: MonitorTray list | on N | off N | toggle N | restore | dpms-off | dbg");
+            Console.WriteLine("Usage: MonitorTray list | on N | off N | toggle N | restore | dpms-off | bright | dbg");
         }
     }
 
@@ -1786,6 +2875,8 @@ namespace MonitorTray
         static void Main(string[] args)
         {
             Loc.Load();
+            Ui.Load();
+            Fonts.Load();
 
             if (args != null && args.Length > 0)
             {

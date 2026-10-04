@@ -7,14 +7,8 @@ set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 set REF=/r:System.dll /r:System.Core.dll /r:System.Management.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll
 
-rem --- иконка (генерируется, если её ещё нет) ---
-if not exist MonitorTray.ico (
-  "%CSC%" /nologo /target:exe /r:System.Drawing.dll /out:icongen.exe icongen.cs || exit /b 1
-  icongen.exe || exit /b 1
-)
-
-rem --- основная программа ---
-"%CSC%" /nologo /codepage:65001 /target:winexe /win32icon:MonitorTray.ico /res:MonitorTray.ico /win32manifest:app.manifest /out:MonitorTray.exe %REF% MonitorTray.cs
+rem --- основная программа (шрифт Roboto встраивается из папки fonts) ---
+"%CSC%" /nologo /codepage:65001 /target:winexe /win32icon:MonitorTray.ico /win32manifest:app.manifest /res:fonts\Roboto-Regular.ttf.gz,Roboto-Regular.ttf.gz /res:fonts\Roboto-Medium.ttf.gz,Roboto-Medium.ttf.gz /res:fonts\Roboto-SemiBold.ttf.gz,Roboto-SemiBold.ttf.gz /out:MonitorTray.exe %REF% MonitorTray.cs
 if errorlevel 1 exit /b 1
 
 rem --- деинсталлятор (промежуточный файл) ---
