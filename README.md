@@ -28,18 +28,18 @@ Got a second monitor that you only use sometimes, but it keeps glowing in the co
 
 ## Features
 
-| | |
-|---|---|
-| 🖥 **Turn monitors off and on** | One switch per monitor. Works with any monitor and puts your windows back when it returns |
-| 😴 **Sleep without flicker** | Monitors that support it just fall asleep: other screens don't blink, windows stay in place, and the monitor wakes when the cursor arrives |
-| ☀️ **Brightness** | One slider for all screens or one per monitor, including the built-in screen of a laptop |
-| 🔀 **HDMI / DP switch** | Flip a monitor between this PC and a laptop or console |
-| ⭐ **Primary monitor** | Make any monitor the main one right from the window |
-| 💤 **AFK mode** | A monitor you haven't looked at for a while turns off by itself, which is handy for OLED. Off by default |
-| 🌙 **Sleep all screens** | One click; they wake on the first mouse move |
-| 🔄 **Automatic updates** | New versions install with one click and are checked against SHA-256 |
-| 🎨 **Windows 11 design** | Light and dark theme, rounded corners and shadow (on Windows 10 too), English / Русский |
-| 🪶 **Tiny and portable** | ~280 KB, no installation and no admin rights; command line for scripts and hotkeys |
+| | | |
+|:-:|---|---|
+| <img src="docs/features/power.png?v=1.4" width="32" alt=""> | **Turn monitors off and on** | One switch per monitor. Works with any monitor and puts your windows back when it returns |
+| <img src="docs/features/sleep.png?v=1.4" width="32" alt=""> | **Sleep without flicker** | Monitors that support it just fall asleep: other screens don't blink, windows stay in place, and the monitor wakes when the cursor arrives |
+| <img src="docs/features/brightness.png?v=1.4" width="32" alt=""> | **Brightness** | One slider for all screens or one per monitor, including the built-in screen of a laptop |
+| <img src="docs/features/inputs.png?v=1.4" width="32" alt=""> | **HDMI / DP switch** | Flip a monitor between this PC and a laptop or console |
+| <img src="docs/features/primary.png?v=1.4" width="32" alt=""> | **Primary monitor** | Make any monitor the main one right from the window |
+| <img src="docs/features/afk.png?v=1.4" width="32" alt=""> | **AFK mode** | A monitor you haven't looked at for a while turns off by itself, which is handy for OLED. Off by default |
+| <img src="docs/features/sleep-all.png?v=1.4" width="32" alt=""> | **Sleep all screens** | One click; they wake on the first mouse move |
+| <img src="docs/features/update.png?v=1.4" width="32" alt=""> | **Automatic updates** | New versions install with one click and are checked against SHA-256 |
+| <img src="docs/features/design.png?v=1.4" width="32" alt=""> | **Windows 11 design** | Light and dark theme, rounded corners and shadow (on Windows 10 too), English / Русский |
+| <img src="docs/features/portable.png?v=1.4" width="32" alt=""> | **Tiny and portable** | ~280 KB, no installation and no admin rights; command line for scripts and hotkeys |
 
 > **What needs DDC/CI?** Turning monitors off and on works with every monitor. Brightness, sleep and input switching use DDC/CI, the monitor's control channel over the video cable. MonitorTray checks what each monitor supports and shows only what actually works.
 
