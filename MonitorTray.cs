@@ -794,6 +794,59 @@ namespace MonitorTray
             catch { }
         }
 
+        // ---- синтез режимов: новые драйверы не хранят режимы выключенных мониторов ----
+        // TARGET-режим собирается по стандарту CVT-RB из сохранённого разрешения;
+        // Windows сверит запрос с EDID и подставит точный режим монитора.
+        static void GetSavedModeSize(string gdi, out uint w, out uint h, out uint f)
+        {
+            w = 1920; h = 1080; f = 60;
+            try
+            {
+                string v;
+                if (gdi != null && LoadModeFile().TryGetValue(gdi, out v))
+                {
+                    string[] pp = v.Split('|');
+                    uint pw, ph, pf;
+                    if (pp.Length >= 3 && uint.TryParse(pp[0], out pw) && uint.TryParse(pp[1], out ph) && uint.TryParse(pp[2], out pf)
+                        && pw >= 640 && ph >= 480 && pf >= 24 && pw <= 16384 && ph <= 16384)
+                    { w = pw; h = ph; f = pf; }
+                }
+            }
+            catch { }
+        }
+
+        static Native.DISPLAYCONFIG_MODE_INFO MakeTargetMode(uint targetId, Native.LUID adapter, uint w, uint h, uint f)
+        {
+            uint htotal = w + 160;          // CVT-RB: горизонтальное гашение 160
+            uint vtotal = h + 40;           // CVT-RB: вертикальное гашение ~40
+            ulong pc = (ulong)htotal * vtotal * f;
+            pc = pc / 10000 * 10000;        // кратность 10 кГц
+            Native.DISPLAYCONFIG_MODE_INFO mi = new Native.DISPLAYCONFIG_MODE_INFO();
+            mi.infoType = 2;                // TARGET
+            mi.id = targetId;
+            mi.adapterId = adapter;
+            mi.u0 = pc;                                              // pixelRate
+            mi.u1 = ((ulong)(uint)pc << 32) | htotal;                // hSync: num/den
+            mi.u2 = ((ulong)1000 << 32) | (f * 1000);                // vSync: num/den
+            mi.u3 = ((ulong)h << 32) | w;                            // activeSize
+            mi.u4 = ((ulong)vtotal << 32) | htotal;                  // totalSize
+            mi.u5 = ((ulong)1 << 32);                                // progressive
+            return mi;
+        }
+
+        // SOURCE-режим: наблюдаемая раскладка — u0=размер, u1.lo=формат(4=32bpp), u1.hi=x, u2.lo=y
+        static Native.DISPLAYCONFIG_MODE_INFO MakeSourceMode(uint sourceId, Native.LUID adapter, uint w, uint h, int x, int y)
+        {
+            Native.DISPLAYCONFIG_MODE_INFO mi = new Native.DISPLAYCONFIG_MODE_INFO();
+            mi.infoType = 1;                // SOURCE
+            mi.id = sourceId;
+            mi.adapterId = adapter;
+            mi.u0 = ((ulong)h << 32) | w;
+            mi.u1 = ((ulong)(uint)x << 32) | 4;
+            mi.u2 = (ulong)(uint)y;
+            return mi;
+        }
+
         static bool TargetNowActive(Mon m)
         {
             Native.DISPLAYCONFIG_PATH_INFO[] ap;
@@ -969,8 +1022,23 @@ namespace MonitorTray
                 HashSet<uint> seenNeed = new HashSet<uint>();
                 foreach (uint u in need) if (seenNeed.Add(u)) uniqNeed.Add(u);
 
+                // Чего не хватает кандидату: новые драйверы не хранят режимы
+                // выключенных мониторов — синтезируем их сами.
+                bool srcMissing = _virtual
+                    ? (cand.sourceInfo.modeInfoIdx & 0xFFFF) == 0xFFFF
+                    : cand.sourceInfo.modeInfoIdx == Native.MODE_IDX_INVALID;
+                bool tgtMissing = _virtual
+                    ? (cand.targetInfo.modeInfoIdx & 0xFFFF) == 0xFFFF
+                    : cand.targetInfo.modeInfoIdx == Native.MODE_IDX_INVALID;
+
+                List<Native.DISPLAYCONFIG_MODE_INFO> synth = new List<Native.DISPLAYCONFIG_MODE_INFO>();
+                uint sw, sh, sf;
+                GetSavedModeSize(m.GdiName, out sw, out sh, out sf);
+                System.Drawing.Rectangle vs0 = SystemInformation.VirtualScreen;
+
                 Native.DISPLAYCONFIG_PATH_INFO[] mergedP = new Native.DISPLAYCONFIG_PATH_INFO[ap.Length + 1];
-                Native.DISPLAYCONFIG_MODE_INFO[] mergedM = new Native.DISPLAYCONFIG_MODE_INFO[am.Length + uniqNeed.Count];
+                Native.DISPLAYCONFIG_MODE_INFO[] mergedM = new Native.DISPLAYCONFIG_MODE_INFO[
+                    am.Length + uniqNeed.Count + (srcMissing ? 1 : 0) + (tgtMissing ? 1 : 0)];
                 Array.Copy(ap, mergedP, ap.Length);
                 Array.Copy(am, mergedM, am.Length);
                 uint off = (uint)am.Length;
@@ -984,12 +1052,79 @@ namespace MonitorTray
                     if (cand.sourceInfo.modeInfoIdx != Native.MODE_IDX_INVALID) cand.sourceInfo.modeInfoIdx += off;
                     if (cand.targetInfo.modeInfoIdx != Native.MODE_IDX_INVALID) cand.targetInfo.modeInfoIdx += off;
                 }
-                mergedP[ap.Length] = cand;
                 for (int j = 0; j < uniqNeed.Count; j++)
                     mergedM[am.Length + j] = allm[uniqNeed[j]];
+                uint extraBase = (uint)(am.Length + uniqNeed.Count);
+
+                if (srcMissing)
+                {
+                    synth.Add(MakeSourceMode(cand.sourceInfo.id, cand.sourceInfo.adapterId, sw, sh, vs0.Right, 0));
+                    if (_virtual)
+                        cand.sourceInfo.modeInfoIdx = (uint)((int)(cand.sourceInfo.modeInfoIdx & 0xFFFF0000) | (int)extraBase);
+                    else
+                        cand.sourceInfo.modeInfoIdx = extraBase;
+                }
+                if (tgtMissing)
+                {
+                    synth.Add(MakeTargetMode(cand.targetInfo.id, cand.targetInfo.adapterId, sw, sh, sf));
+                    uint tgtIdx = extraBase + (uint)(synth.Count - 1);
+                    if (_virtual)
+                        cand.targetInfo.modeInfoIdx = (uint)((int)((cand.targetInfo.modeInfoIdx >> 16) << 16) | (int)tgtIdx);
+                    else
+                        cand.targetInfo.modeInfoIdx = tgtIdx;
+                }
+                for (int j = 0; j < synth.Count; j++)
+                    mergedM[(int)extraBase + j] = synth[j];
+
+                mergedP[ap.Length] = cand;
 
                 hr = TrySet(mergedP, mergedM, verbose);
                 if (hr == 0 && TargetNowActive(m)) return 0;
+            }
+
+            // Последний шанс: новые драйверы NVIDIA не сохраняют режимы выключенного
+            // монитора и игнорируют пути с переиспользованными источниками. Помогает
+            // путь со СВЕЖИМ source-id и полностью синтезированными режимами
+            // (проверено на Win10 22H2 + драйвер NVIDIA 580.x).
+            if (!TargetNowActive(m))
+            {
+                uint sw2, sh2, sf2;
+                GetSavedModeSize(m.GdiName, out sw2, out sh2, out sf2);
+                System.Drawing.Rectangle vs1 = SystemInformation.VirtualScreen;
+                foreach (int ci in cands)
+                {
+                    Native.DISPLAYCONFIG_PATH_INFO base1 = allp[ci];
+
+                    Native.DISPLAYCONFIG_PATH_INFO np2 = new Native.DISPLAYCONFIG_PATH_INFO();
+                    np2.sourceInfo.adapterId = base1.targetInfo.adapterId;
+                    np2.sourceInfo.id = base1.targetInfo.id; // свежий id источника
+                    np2.targetInfo = base1.targetInfo;
+                    np2.targetInfo.modeInfoIdx = Native.MODE_IDX_INVALID;
+                    np2.flags = 1;
+
+                    Native.DISPLAYCONFIG_PATH_INFO[] mergedP2 = new Native.DISPLAYCONFIG_PATH_INFO[ap.Length + 1];
+                    Array.Copy(ap, mergedP2, ap.Length);
+                    Native.DISPLAYCONFIG_MODE_INFO[] mergedM2 = new Native.DISPLAYCONFIG_MODE_INFO[am.Length + 2];
+                    Array.Copy(am, mergedM2, am.Length);
+                    mergedM2[am.Length] = MakeSourceMode(np2.sourceInfo.id, np2.sourceInfo.adapterId, sw2, sh2, vs1.Right, 0);
+                    mergedM2[am.Length + 1] = MakeTargetMode(np2.targetInfo.id, np2.targetInfo.adapterId, sw2, sh2, sf2);
+                    uint base2 = (uint)am.Length;
+                    if (_virtual)
+                    {
+                        np2.sourceInfo.modeInfoIdx = base2;
+                        np2.targetInfo.modeInfoIdx = ((0xFFFFu) << 16) | (base2 + 1);
+                    }
+                    else
+                    {
+                        np2.sourceInfo.modeInfoIdx = base2;
+                        np2.targetInfo.modeInfoIdx = base2 + 1;
+                    }
+                    mergedP2[ap.Length] = np2;
+
+                    if (verbose) Console.Error.WriteLine("  [enable] trying fresh-source fallback…");
+                    hr = TrySet(mergedP2, mergedM2, verbose);
+                    if (hr == 0 && TargetNowActive(m)) return 0;
+                }
             }
 
             if (!TargetNowActive(m))
