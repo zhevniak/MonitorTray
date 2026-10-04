@@ -12,7 +12,7 @@
 <p align="center">
   <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/zhevniak/MonitorTray?label=download" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/badge/size-~230%20KB-success" alt="Size">
+  <img src="https://img.shields.io/badge/size-~260%20KB-success" alt="Size">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
@@ -32,25 +32,27 @@ It works even with monitors that **don't support DDC/CI power control** — tool
 - 📏 **Remembers resolution & refresh rate** — a custom mode like 1600×1024@165 is restored instead of jumping to the native default
 - ☀️ **Brightness control** — one slider for all screens, or a separate slider for each monitor (for monitors that support DDC/CI)
 - 🌙 **Put all screens to sleep** — one click, they wake on the first mouse move
+- 💤 **AFK mode** — a monitor the cursor hasn't visited for a while turns off by itself and comes back with a push of the mouse (off by default)
+- 🔄 **Automatic updates** — new versions are found on GitHub and installed with one click, verified by SHA-256
 - 🎨 **Windows 11-style window** — light and dark theme, rounded corners and a soft shadow (on Windows 10 too), crisp Roboto font
 - 🔵 **Colorful tray icon** that follows the theme you pick
 - 🌐 **English / Русский**, switchable on the fly
-- 🚀 **Start with Windows** — optional, one checkbox
+- 🖱 **Tray menu** — right-click the icon for *Start with Windows*, *Check for updates*, *Language*, *About* and *Exit*
 - ⌨️ **Command line** for scripts and hotkeys
-- 🪶 **Tiny (~230 KB), no dependencies, no admin rights** — plain .NET Framework 4.x, which is built into Windows 10/11
+- 🪶 **Tiny (~260 KB), no dependencies, no admin rights** — plain .NET Framework 4.x, which is built into Windows 10/11
 
 ## Install
 
 Download from the [Releases](../../releases/latest) page:
 
-1. **`MonitorTray.exe`** (or the portable zip) — recommended. Fully portable: just run it, nothing is installed. Tick *Start with Windows* in the window to launch it automatically.
+1. **`MonitorTray.exe`** (or the portable zip) — recommended. Fully portable: just run it, nothing is installed. Turn on *Start with Windows* in the tray icon's right-click menu to launch it automatically.
 2. **`MonitorTraySetup.exe`** — optional installer: installs per-user into `%LOCALAPPDATA%`, adds Start-menu / desktop shortcuts and an entry in *Settings → Apps* for uninstalling.
 
 No admin rights required. If Windows shows *"Windows protected your PC"*, see [SmartScreen warning](#smartscreen-warning-windows-protected-your-pc) below.
 
 ## How to use
 
-Click the tray icon (left or right button) — the MonitorTray window opens next to the tray.
+**Left-click** the tray icon — the MonitorTray window opens next to the tray. **Right-click** it for a small menu with *Start with Windows*, *Check for updates*, *Language* (EN / RU), *Open*, *About* and *Exit*.
 
 ### Monitors
 
@@ -67,21 +69,36 @@ Brightness works over DDC/CI; if no monitor supports it, the section is simply h
 
 ### Actions & settings
 
-**Put all screens to sleep**, **Start with Windows**, **Language** and **About**. Click the section header to collapse it when you don't need it:
+**Put all screens to sleep** and **AFK mode**. Click the section header to collapse it when you don't need it:
 
 <p align="center">
   <img src="docs/window-compact.png" width="400" alt="Compact view with the settings collapsed">
   <img src="docs/window-russian.png" width="400" alt="Russian interface, dark theme">
 </p>
 
-### Theme, tray icon and closing
+### AFK mode
+
+Turn it on in *Actions & settings* and set your own time with **−** / **+** or the mouse wheel — from 1 minute to 4 hours, 30 minutes by default. A monitor the mouse cursor hasn't visited for that long turns off by itself (handy for OLED screens and for a second monitor you only glance at). It is **off by default**.
+
+- **Turning it back on:** push the mouse against the screen edge on the side where that monitor is, or click it in the window. If it turned off while you were away from the PC, it comes back on by itself with your first mouse move or key press
+- **Choose the monitors:** each monitor has its own switch in the AFK card — by default all of them except the primary one
+- **It never interrupts you:** the monitor with the cursor and the last monitor that is still on are never turned off, and nothing happens while a video is playing or a fullscreen game / movie is on that monitor
+- Monitors turned off by AFK mode show an **AFK** badge, and they are turned back on when you exit MonitorTray
+
+### Updates
+
+Once a day MonitorTray checks GitHub for a new release (*Check for updates* in the right-click menu, on by default — it is a single request to the GitHub API). When there is one, a banner appears at the top of the window: press **Update**, and the new version is downloaded, checked against the release's `SHA256SUMS.txt` and installed — the portable exe replaces itself, the installed version runs the new installer silently (your autostart and shortcut choices are kept).
+
+### Tray menu, theme and closing
 
 - The **moon / sun** button in the top corner switches between the light and dark theme — the tray icon changes with it:
 
   <img src="docs/tray-icon.png" width="384" alt="Tray icon in the light and dark theme, on a dark and a light taskbar">
 
-- The **✕** button exits MonitorTray. To just hide the window, click anywhere outside it or press **Esc**
-- The theme, language, per-monitor sliders and collapsed sections are remembered
+- The **✕** button, a click anywhere outside the window or **Esc** hide it to the tray. To quit, right-click the tray icon → **Exit**:
+
+  <img src="docs/tray-menu.png" width="300" alt="Tray icon right-click menu">
+- All settings — theme, language, AFK mode, per-monitor sliders, collapsed sections — are remembered
 
 ## Command line
 
@@ -165,6 +182,7 @@ It produces `MonitorTray.exe` (the app) and `MonitorTraySetup.exe` (a single-fil
 | `fonts/` | Roboto (Regular / Medium / SemiBold, Latin + Cyrillic), embedded into the exe |
 | `MonitorTray.ico`, `app.manifest` | app icon and manifest (per-monitor DPI aware) |
 | `docs/` | images for this README |
+| `.github/workflows/build.yml` | builds every push; for `v*` tags publishes a release with `SHA256SUMS.txt` (used by the auto-updater) |
 
 ## License
 

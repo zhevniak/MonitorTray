@@ -41,10 +41,21 @@ namespace MonitorTraySetup
         static void Main(string[] args)
         {
             Application.EnableVisualStyles();
-            bool silent = args.Length > 0 && args[0].ToLowerInvariant() == "silent";
-            if (silent)
+            string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+            if (mode == "silent")
             {
                 Install(true, true, true, false);
+                return;
+            }
+            if (mode == "update")
+            {
+                // автообновление из программы: тихо, с прежними настройками автозапуска и ярлыка
+                bool auto = false;
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+                    auto = k != null && k.GetValue("MonitorTray") != null;
+                bool desk = File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                    "MonitorTray.lnk"));
+                Install(auto, desk, true, false);
                 return;
             }
             Application.Run(new SetupForm());

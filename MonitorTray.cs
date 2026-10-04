@@ -9,8 +9,12 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
 using System.Management;
 using System.Text;
@@ -1608,10 +1612,32 @@ namespace MonitorTray
                 case "bright_all": return ru ? "Общая яркость (все экраны)" : "All screens";
                 case "sleep_title": return ru ? "Погасить все экраны" : "Put all screens to sleep";
                 case "sleep_hint": return ru ? "до первого движения мыши" : "until the mouse moves";
-                case "lang_row": return ru ? "Язык: {0}" : "Language: {0}";
-                case "exit_full": return ru ? "Выйти из программы" : "Exit MonitorTray";
+                case "language": return ru ? "Язык" : "Language";
+                case "tip_hide": return ru ? "Свернуть в трей" : "Hide to tray";
+                case "menu_open": return ru ? "Открыть MonitorTray" : "Open MonitorTray";
+                case "menu_exit": return ru ? "Выход" : "Exit";
                 case "tip_theme": return ru ? "Светлая / тёмная тема" : "Light / dark theme";
                 case "per_monitor": return ru ? "По мониторам" : "Per monitor";
+                case "afk_title": return ru ? "AFK-режим" : "AFK mode";
+                case "afk_sub": return ru ? "Гасить монитор без курсора: {0}" : "Turn off an idle monitor after {0}";
+                case "afk_after": return ru ? "Через" : "After";
+                case "afk_min": return ru ? "мин" : "min";
+                case "afk_hour": return ru ? "ч" : "h";
+                case "badge_afk": return "AFK";
+                case "afk_off_hint": return ru
+                    ? "{0} выключен: курсор давно не заходил на него. Чтобы включить, толкните мышь в край экрана в его сторону или нажмите на него в окне MonitorTray."
+                    : "{0} was turned off: the cursor hasn't been there for a while. To turn it back on, push the mouse against the screen edge on its side or click it in the MonitorTray window.";
+                case "upd_check": return ru ? "Проверять обновления" : "Check for updates";
+                case "upd_title": return ru ? "Доступна версия {0}" : "Version {0} is available";
+                case "upd_sub": return ru ? "Новый релиз на GitHub" : "New release on GitHub";
+                case "upd_button": return ru ? "Обновить" : "Update";
+                case "upd_open": return ru ? "Открыть" : "Open";
+                case "upd_progress": return ru ? "Загрузка… {0}%" : "Downloading… {0}%";
+                case "upd_failed": return ru ? "Не удалось обновить" : "Update failed";
+                case "upd_nofile": return ru ? "в релизе нет нужного файла" : "the release has no matching file";
+                case "upd_badhash": return ru ? "файл повреждён (не совпала контрольная сумма)" : "the file is damaged (checksum mismatch)";
+                case "upd_balloon": return ru ? "Доступна MonitorTray {0}. Нажмите, чтобы обновить." : "MonitorTray {0} is available. Click to update.";
+                case "upd_done": return ru ? "MonitorTray обновлена до версии {0}" : "MonitorTray has been updated to {0}";
                 case "autostart": return ru ? "Запускать при входе в Windows" : "Start with Windows";
                 case "about": return ru ? "О программе" : "About";
                 case "tooltip": return ru ? "Мониторы: {0} из {1} вкл." : "Monitors: {0} of {1} on";
@@ -1725,12 +1751,27 @@ namespace MonitorTray
         }
     }
 
-    // Сохраняемые настройки интерфейса: тема и раскрытость ползунков по мониторам
+    // Сохраняемые настройки: тема, раскрытость разделов, AFK-режим, автообновление
     internal static class Ui
     {
         public static bool DarkTheme = false;
         public static bool SlidersExpanded = false;
         public static bool SettingsExpanded = true;
+        public static bool AfkEnabled = false;      // AFK-режим по умолчанию выключен
+        public static int AfkMinutes = 30;          // своё время, 1..240 мин
+        public static bool AfkHintShown = false;    // подсказку «как включить обратно» показали
+        public static bool AutoUpdate = true;
+        // монитор → участвует ли в AFK-режиме (кого нет в списке: все, кроме основного)
+        public static Dictionary<string, bool> AfkMonitors = new Dictionary<string, bool>();
+
+        // постоянный ключ монитора (путь устройства не меняется между перезагрузками)
+        public static string MonKey(Mon m) { return m.DevicePath.Length > 0 ? m.DevicePath : m.Name; }
+
+        public static bool AfkIncluded(Mon m)
+        {
+            bool v;
+            return AfkMonitors.TryGetValue(MonKey(m), out v) ? v : !m.Primary;
+        }
 
         static string UiFile()
         {
@@ -1751,6 +1792,18 @@ namespace MonitorTray
                         else if (line == "sliders=1") SlidersExpanded = true;
                         else if (line == "settings=1") SettingsExpanded = true;
                         else if (line == "settings=0") SettingsExpanded = false;
+                        else if (line == "afk=1") AfkEnabled = true;
+                        else if (line == "afk=0") AfkEnabled = false;
+                        else if (line == "afk_hint=1") AfkHintShown = true;
+                        else if (line == "update=1") AutoUpdate = true;
+                        else if (line == "update=0") AutoUpdate = false;
+                        else if (line.StartsWith("afk_mon=") && line.Length > 10)
+                            AfkMonitors[line.Substring(10)] = line[8] == '1';
+                        else if (line.StartsWith("afk_min="))
+                        {
+                            int v;
+                            if (int.TryParse(line.Substring(8), out v) && v >= 1 && v <= 240) AfkMinutes = v;
+                        }
                         else if (line == "sliders=0") SlidersExpanded = false;
                     }
                 }
@@ -1763,12 +1816,19 @@ namespace MonitorTray
         {
             try
             {
-                System.IO.File.WriteAllLines(UiFile(), new string[]
+                List<string> lines = new List<string>
                 {
                     DarkTheme ? "theme=dark" : "theme=light",
                     SlidersExpanded ? "sliders=1" : "sliders=0",
-                    SettingsExpanded ? "settings=1" : "settings=0"
-                });
+                    SettingsExpanded ? "settings=1" : "settings=0",
+                    AfkEnabled ? "afk=1" : "afk=0",
+                    "afk_min=" + AfkMinutes,
+                    AfkHintShown ? "afk_hint=1" : "afk_hint=0",
+                    AutoUpdate ? "update=1" : "update=0"
+                };
+                foreach (KeyValuePair<string, bool> kv in AfkMonitors)
+                    lines.Add("afk_mon=" + (kv.Value ? "1" : "0") + "|" + kv.Key);
+                System.IO.File.WriteAllLines(UiFile(), lines.ToArray());
             }
             catch { }
         }
@@ -1829,6 +1889,437 @@ namespace MonitorTray
         }
     }
 
+    // ------------------------------------------------------------------ AFK-режим
+    // Монитор, на который курсор не заходил N минут, выключается (как кнопкой в окне).
+    // Включается обратно: «толчком» мыши в край экрана, за которым он был, кликом в окне,
+    // а если выключился, пока за ПК никого не было, — при первом же движении или нажатии.
+    // Мониторы выбираются в окне (по умолчанию — все, кроме основного). Не гасит монитор с курсором,
+    // последний включённый, монитор с полноэкранным окном и не срабатывает, пока какая-нибудь
+    // программа (видеоплеер, браузер с видео) просит не гасить экран.
+    internal class AfkWatcher : NativeWindow
+    {
+        class Sleeper { public string Key, Name, Gdi; public Rectangle Bounds; public bool WakeOnInput; public int At; }
+
+        [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct RAWINPUTDEVICE { public ushort usUsagePage, usUsage; public uint dwFlags; public IntPtr hwndTarget; }
+
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+        [DllImport("powrprof.dll")] static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out uint outBuf, uint outLen);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint n, uint size);
+        [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr h, uint cmd, IntPtr data, ref uint size, uint headerSize);
+
+        const int PushNeeded = 300;      // сколько «отсчётов» мыши упереть в край, чтобы разбудить монитор
+
+        readonly TrayApp _app;
+        readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
+        readonly Dictionary<string, int> _seen = new Dictionary<string, int>(); // экран → когда там был курсор
+        readonly List<Sleeper> _sleepers = new List<Sleeper>();
+        readonly uint _pid = (uint)Process.GetCurrentProcess().Id;
+        Sleeper _pushTarget;
+        int _pushDir, _pushSum, _pushAt;
+        bool _raw;
+
+        public AfkWatcher(TrayApp app)
+        {
+            _app = app;
+            CreateHandle(new CreateParams()); // невидимое окно — получатель сырого ввода мыши
+            _timer.Tick += delegate { Tick(); };
+            Update();
+        }
+
+        public static string Key(Mon m) { return m.AdapterId.LowPart + ":" + m.AdapterId.HighPart + ":" + m.TargetId; }
+
+        public bool IsSleeping(Mon m)
+        {
+            string k = Key(m);
+            foreach (Sleeper s in _sleepers) if (s.Key == k) return true;
+            return false;
+        }
+
+        // монитор включили вручную — он больше не «спит»
+        public void Forget(Mon m)
+        {
+            string k = Key(m);
+            _sleepers.RemoveAll(s => s.Key == k);
+            Update();
+        }
+
+        // настройка поменялась — запустить или остановить слежение
+        public void Update()
+        {
+            bool need = Ui.AfkEnabled || _sleepers.Count > 0;
+            if (need && !_timer.Enabled) { _seen.Clear(); _timer.Start(); }
+            if (!need) _timer.Stop();
+            _timer.Interval = _sleepers.Count > 0 ? 250 : 1000;
+            SetRaw(_sleepers.Count > 0);
+        }
+
+        // при выходе из программы спящие мониторы включаются
+        public void WakeAll()
+        {
+            foreach (Sleeper s in _sleepers.ToArray()) Wake(s, false);
+            _timer.Stop();
+            SetRaw(false);
+            DestroyHandle();
+        }
+
+        void Tick()
+        {
+            int now = Environment.TickCount;
+            Screen[] screens = Screen.AllScreens;
+            int idle = IdleMs();
+
+            // монитор включили другим способом — забыть о нём (Windows обновляет список
+            // экранов не мгновенно, поэтому первые секунды после выключения не проверяем)
+            _sleepers.RemoveAll(s => unchecked(now - s.At) > 5000 && Array.Exists(screens, sc => sc.DeviceName == s.Gdi));
+            // вернулись к ПК — включить то, что выключилось, пока никого не было
+            if (idle < 1000)
+                foreach (Sleeper s in _sleepers.ToArray()) if (s.WakeOnInput) Wake(s, true);
+
+            if (Ui.AfkEnabled)
+            {
+                Point p = Cursor.Position;
+                bool hold = _app.PopupBusy || DisplayRequired();
+                int limit = Ui.AfkMinutes * 60000;
+                foreach (Screen sc in screens)
+                {
+                    int t;
+                    if (hold || sc.Bounds.Contains(p) || !_seen.TryGetValue(sc.DeviceName, out t))
+                    {
+                        _seen[sc.DeviceName] = now;
+                        continue;
+                    }
+                    if (unchecked(now - t) < limit) continue;
+                    _seen[sc.DeviceName] = now;
+                    if (HasFullscreen(sc.Bounds)) continue; // игра или фильм на весь экран
+                    Sleep(sc, idle >= limit);
+                    break; // не больше одного монитора за раз
+                }
+            }
+            Update();
+        }
+
+        void Sleep(Screen sc, bool wakeOnInput)
+        {
+            List<Mon> mons = Svc.List();
+            Mon m = mons.Find(x => x.Active && x.GdiName == sc.DeviceName);
+            if (m == null || !Ui.AfkIncluded(m)) return;
+            if (mons.FindAll(x => x.Active).Count < 2) return; // последний включённый не гасим
+            if (Svc.Disable(m, false) != 0) return;
+            Sleeper s = new Sleeper();
+            s.Key = Key(m); s.Name = m.Name; s.Gdi = sc.DeviceName; s.Bounds = sc.Bounds; s.WakeOnInput = wakeOnInput;
+            s.At = Environment.TickCount;
+            _sleepers.Add(s);
+            _app.OnAfkChanged(m.Name, true);
+        }
+
+        void Wake(Sleeper s, bool notify)
+        {
+            _sleepers.Remove(s);
+            string k = s.Key;
+            Mon m = Svc.List().Find(x => !x.Active && Key(x) == k);
+            if (m != null) Svc.Enable(m, false);
+            _seen.Clear(); // отсчёт простоя — заново
+            if (notify) _app.OnAfkChanged(s.Name, false);
+        }
+
+        static int IdleMs()
+        {
+            LASTINPUTINFO li = new LASTINPUTINFO();
+            li.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref li)) return 0;
+            return (int)unchecked((uint)Environment.TickCount - li.dwTime);
+        }
+
+        // кто-то просит не гасить экран (ES_DISPLAY_REQUIRED) — так делают плееры и браузеры с видео
+        static bool DisplayRequired()
+        {
+            try
+            {
+                uint state;
+                return CallNtPowerInformation(16 /*SystemExecutionState*/, IntPtr.Zero, 0, out state, 4) == 0 && (state & 0x2) != 0;
+            }
+            catch { return false; }
+        }
+
+        // окно на весь монитор (не развёрнутое, а именно полноэкранное: игра, видео, F11)
+        bool HasFullscreen(Rectangle b)
+        {
+            bool found = false;
+            Native.EnumWindows(delegate(IntPtr h, IntPtr lp)
+            {
+                if (!Native.IsWindowVisible(h) || IsIconic(h) || IsZoomed(h)) return true;
+                int cloaked;
+                if (Native.DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, out cloaked, 4) == 0 && cloaked != 0) return true;
+                RECT r;
+                if (!GetWindowRect(h, out r)) return true;
+                if (r.Left > b.Left || r.Top > b.Top || r.Right < b.Right || r.Bottom < b.Bottom) return true;
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (pid == _pid) return true;
+                StringBuilder cls = new StringBuilder(64);
+                GetClassName(h, cls, 64);
+                string c = cls.ToString();
+                if (c == "Progman" || c == "WorkerW" || c.StartsWith("Shell_")) return true; // рабочий стол, панель задач
+                found = true;
+                return false;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        // ---- «толчок» мыши в край экрана: сырой ввод мыши приходит, даже когда курсор упёрся
+        void SetRaw(bool on)
+        {
+            if (on == _raw || (on && Handle == IntPtr.Zero)) return;
+            RAWINPUTDEVICE[] d = new RAWINPUTDEVICE[1];
+            d[0].usUsagePage = 1; d[0].usUsage = 2; // мышь
+            d[0].dwFlags = on ? 0x100u /*RIDEV_INPUTSINK*/ : 0x1u /*RIDEV_REMOVE*/;
+            d[0].hwndTarget = on ? Handle : IntPtr.Zero;
+            if (RegisterRawInputDevices(d, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)))) _raw = on;
+        }
+
+        protected override void WndProc(ref Message msg)
+        {
+            if (msg.Msg == 0x00FF /*WM_INPUT*/ && _sleepers.Count > 0) OnRawInput(msg.LParam);
+            base.WndProc(ref msg);
+        }
+
+        void OnRawInput(IntPtr hRaw)
+        {
+            int hs = 8 + 2 * IntPtr.Size; // RAWINPUTHEADER
+            uint size = 0;
+            GetRawInputData(hRaw, 0x10000003 /*RID_INPUT*/, IntPtr.Zero, ref size, (uint)hs);
+            if (size == 0 || size > 1024) return;
+            IntPtr buf = Marshal.AllocHGlobal((int)size);
+            try
+            {
+                if (GetRawInputData(hRaw, 0x10000003, buf, ref size, (uint)hs) != size) return;
+                if (Marshal.ReadInt32(buf, 0) != 0 /*RIM_TYPEMOUSE*/) return;
+                if ((Marshal.ReadInt16(buf, hs) & 1) != 0) return; // абсолютные координаты (планшет, RDP)
+                Push(Marshal.ReadInt32(buf, hs + 12), Marshal.ReadInt32(buf, hs + 16));
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        void Push(int dx, int dy)
+        {
+            Point p = Cursor.Position;
+            Rectangle b = Screen.FromPoint(p).Bounds;
+            int dir = 0, amount = 0;
+            Point q = p;
+            if (dx > 0 && p.X >= b.Right - 1) { dir = 1; amount = dx; q = new Point(b.Right, p.Y); }
+            else if (dx < 0 && p.X <= b.Left) { dir = 2; amount = -dx; q = new Point(b.Left - 1, p.Y); }
+            else if (dy > 0 && p.Y >= b.Bottom - 1) { dir = 3; amount = dy; q = new Point(p.X, b.Bottom); }
+            else if (dy < 0 && p.Y <= b.Top) { dir = 4; amount = -dy; q = new Point(p.X, b.Top - 1); }
+
+            Sleeper target = null;
+            if (dir != 0)
+                foreach (Sleeper s in _sleepers)
+                {
+                    Rectangle r = s.Bounds;
+                    r.Inflate(2, 2);
+                    if (r.Contains(q)) target = s;
+                }
+            int now = Environment.TickCount;
+            if (target == null || target != _pushTarget || dir != _pushDir || unchecked(now - _pushAt) > 400) _pushSum = 0;
+            _pushTarget = target; _pushDir = dir; _pushAt = now;
+            if (target == null) return;
+            _pushSum += amount;
+            if (_pushSum < PushNeeded) return;
+            _pushSum = 0;
+            _pushTarget = null;
+            Wake(target, true);
+            Update();
+        }
+    }
+
+    // ------------------------------------------------------------------ автообновление
+    // Раз в сутки спрашивает GitHub о последнем релизе. Новая версия ставится только по
+    // кнопке «Обновить»: скачивается, сверяется с SHA256SUMS.txt из релиза и заменяет программу
+    // (портативную — подменой exe, установленную — тихим запуском нового установщика).
+    internal class Updater
+    {
+        internal static string ApiUrl = "https://api.github.com/repos/zhevniak/MonitorTray/releases/latest";
+        public const string ReleasesPage = "https://github.com/zhevniak/MonitorTray/releases/latest";
+
+        public Version Available;        // новая версия, если нашлась
+        public bool Downloading;
+        public int Progress;             // 0..100
+        public string Error;             // текст ошибки последней попытки
+
+        readonly TrayApp _app;
+        readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
+        Dictionary<string, string> _assets = new Dictionary<string, string>(); // имя файла → ссылка
+
+        public Updater(TrayApp app)
+        {
+            _app = app;
+            _timer.Interval = 20000; // первая проверка — через 20 с после запуска
+            _timer.Tick += delegate { _timer.Interval = 24 * 3600 * 1000; Check(); };
+            _timer.Start();
+        }
+
+        public static Version Current { get { return Norm(Assembly.GetExecutingAssembly().GetName().Version); } }
+
+        // «1.4» или «1.4.1» — для подписей
+        public static string Pretty(Version v) { return v.Build > 0 ? v.ToString(3) : v.ToString(2); }
+
+        static Version Norm(Version v)
+        {
+            return new Version(v.Major, v.Minor, Math.Max(0, v.Build), Math.Max(0, v.Revision));
+        }
+
+        public void Check()
+        {
+            if (!Ui.AutoUpdate || Downloading) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    string json = Get(ApiUrl);
+                    Match t = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([0-9]+(?:\\.[0-9]+){1,3})\"");
+                    if (!t.Success) return;
+                    Version v = Norm(new Version(t.Groups[1].Value));
+                    Dictionary<string, string> assets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (Match a in Regex.Matches(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+)\""))
+                    {
+                        string url = a.Groups[1].Value;
+                        assets[url.Substring(url.LastIndexOf('/') + 1)] = url;
+                    }
+                    if (v > Current)
+                        _app.Post(delegate { Available = v; _assets = assets; _app.OnUpdateChanged(true); });
+                }
+                catch { } // нет сети — проверим в следующий раз
+            });
+        }
+
+        static bool IsInstalled()
+        {
+            string inst = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "MonitorTray");
+            string dir = Path.GetDirectoryName(Application.ExecutablePath);
+            return string.Equals(Path.GetFullPath(dir).TrimEnd('\\'), Path.GetFullPath(inst).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        public void Start()
+        {
+            if (Available == null || Downloading) return;
+            Downloading = true; Progress = 0; Error = null;
+            _app.OnUpdateChanged(false);
+            bool installed = IsInstalled();
+            string name = installed ? "MonitorTraySetup.exe" : "MonitorTray.exe";
+            Version ver = Available;
+            Dictionary<string, string> assets = _assets;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string file = null;
+                try
+                {
+                    string url, sumsUrl;
+                    if (!assets.TryGetValue(name, out url) || !assets.TryGetValue("SHA256SUMS.txt", out sumsUrl))
+                        throw new Exception(Loc.Get("upd_nofile"));
+                    Match sm = Regex.Match(Get(sumsUrl), "([0-9a-fA-F]{64})\\s+\\*?" + Regex.Escape(name) + "\\s*$", RegexOptions.Multiline);
+                    if (!sm.Success) throw new Exception(Loc.Get("upd_nofile"));
+                    file = installed
+                        ? Path.Combine(Path.GetTempPath(), "MonitorTraySetup-" + ver + ".exe")
+                        : Application.ExecutablePath + ".new";
+                    Download(url, file);
+                    if (!string.Equals(Sha256(file), sm.Groups[1].Value, StringComparison.OrdinalIgnoreCase))
+                        throw new Exception(Loc.Get("upd_badhash"));
+                    string ready = file;
+                    _app.Post(delegate { Finish(installed, ready, ver); });
+                }
+                catch (Exception ex)
+                {
+                    if (file != null) try { File.Delete(file); } catch { }
+                    string msg = ex.Message;
+                    _app.Post(delegate { Downloading = false; Error = msg; _app.OnUpdateChanged(false); });
+                }
+            });
+        }
+
+        void Finish(bool installed, string file, Version ver)
+        {
+            try
+            {
+                if (installed)
+                {
+                    Process.Start(file, "update"); // установщик сам закроет программу и запустит новую
+                    _app.ExitApp();
+                    return;
+                }
+                if (Norm(AssemblyName.GetAssemblyName(file).Version) != ver) throw new Exception(Loc.Get("upd_badhash"));
+                string exe = Application.ExecutablePath, old = exe + ".old";
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(exe, old); // запущенный exe переименовать можно, удалить — нет
+                try { File.Move(file, exe); }
+                catch { File.Move(old, exe); throw; }
+                Process.Start(exe, "--updated " + Process.GetCurrentProcess().Id);
+                _app.ExitApp();
+            }
+            catch (Exception ex)
+            {
+                try { File.Delete(file); } catch { }
+                Downloading = false; Error = ex.Message;
+                _app.OnUpdateChanged(false);
+            }
+        }
+
+        static HttpWebRequest Request(string url)
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2 для GitHub
+            HttpWebRequest r = (HttpWebRequest)WebRequest.Create(url);
+            r.UserAgent = "MonitorTray/" + Current;
+            r.Accept = "application/vnd.github+json, */*";
+            r.Timeout = 20000;
+            return r;
+        }
+
+        static string Get(string url)
+        {
+            using (WebResponse resp = Request(url).GetResponse())
+            using (StreamReader rd = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                return rd.ReadToEnd();
+        }
+
+        void Download(string url, string to)
+        {
+            using (WebResponse resp = Request(url).GetResponse())
+            using (Stream src = resp.GetResponseStream())
+            using (FileStream dst = File.Create(to))
+            {
+                long total = resp.ContentLength, done = 0;
+                int last = -1;
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                {
+                    dst.Write(buf, 0, n);
+                    done += n;
+                    int pc = total > 0 ? (int)(done * 100 / total) : 0;
+                    if (pc / 5 != last / 5)
+                    {
+                        last = pc;
+                        _app.Post(delegate { Progress = pc; _app.OnUpdateChanged(false); });
+                    }
+                }
+            }
+        }
+
+        static string Sha256(string file)
+        {
+            using (SHA256 sha = SHA256.Create())
+            using (FileStream fs = File.OpenRead(file))
+                return BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "");
+        }
+    }
+
     // ------------------------------------------------------------------ GUI: окно
     // Всплывающее окно у трея. Целиком рисуется вручную (одна картинка с альфа-каналом),
     // элементы — прямоугольники-«хиты» с обработчиками.
@@ -1841,8 +2332,8 @@ namespace MonitorTray
 
         // значки шрифта Segoe MDL2 Assets / Segoe Fluent Icons
         const string G_MONITOR = "", G_SUN = "", G_GEAR = "", G_MOON = "",
-            G_GLOBE = "", G_INFO = "", G_CLOSE = "", G_CHECK = "",
-            G_DOWN = "", G_UP = "";
+            G_CLOSE = "", G_CHECK = "",
+            G_DOWN = "", G_UP = "", G_CLOCK = "\uE823", G_DOWNLOAD = "\uE896";
 
         class Hit { public RectangleF R; public string Id; public Action Click; }
 
@@ -1856,8 +2347,6 @@ namespace MonitorTray
         List<Mon> _mons = new List<Mon>();
         List<BrightEntry> _brights;          // живёт, пока окно открыто
         int _allValue;
-        bool _auto;
-        bool _langOpen;
         int _busyIdx = -1;
         string _hover, _press, _drag;
 
@@ -1868,8 +2357,8 @@ namespace MonitorTray
         public bool Busy;                    // идёт переключение монитора — не прятать окно
         public int HiddenAt;
 
-        static readonly StringFormat FmtL = MakeFmt(StringAlignment.Near);
-        static readonly StringFormat FmtC = MakeFmt(StringAlignment.Center);
+        internal static readonly StringFormat FmtL = MakeFmt(StringAlignment.Near);
+        internal static readonly StringFormat FmtC = MakeFmt(StringAlignment.Center);
         static readonly StringFormat FmtR = MakeFmt(StringAlignment.Far);
 
         static StringFormat MakeFmt(StringAlignment a)
@@ -1900,7 +2389,7 @@ namespace MonitorTray
             _tipTimer.Tick += delegate
             {
                 _tipTimer.Stop();
-                string t = _hover == "close" ? Loc.Get("exit_full") : (_hover == "theme" ? Loc.Get("tip_theme") : null);
+                string t = _hover == "close" ? Loc.Get("tip_hide") : (_hover == "theme" ? Loc.Get("tip_theme") : null);
                 if (t != null && Visible)
                 {
                     Point c = PointToClient(Cursor.Position);
@@ -1942,7 +2431,6 @@ namespace MonitorTray
             FlushBright();
             Bright.Close(_brights);
             _brights = null;
-            _langOpen = false;
             _hover = _press = _drag = null;
         }
 
@@ -1961,7 +2449,6 @@ namespace MonitorTray
         void Reload()
         {
             _mons = Svc.List();
-            _auto = Autostart.IsEnabled();
             if (_brights != null) { Bright.Close(_brights); _brights = null; }
             try { _brights = Bright.Open(); } catch { _brights = new List<BrightEntry>(); }
             int sum = 0;
@@ -2006,11 +2493,8 @@ namespace MonitorTray
 
             // Содержимое рисуется на непрозрачной подложке: только так GDI+ даёт
             // ClearType (субпиксельный) текст — он одинаково чёткий в тёмной и светлой теме.
-            int ox = (int)Math.Round(SH * scale);
             int cw = (int)Math.Ceiling(W * scale), ch = (int)Math.Ceiling(_cardH * scale);
-            int bw = cw + 2 * ox, bh = ch + 2 * ox;
             using (Bitmap card = new Bitmap(cw, ch, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
-            using (Bitmap bmp = new Bitmap(bw, bh, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
             {
                 using (Graphics g = Graphics.FromImage(card))
                 {
@@ -2018,28 +2502,11 @@ namespace MonitorTray
                     g.ScaleTransform(scale, scale);
                     PaintCard(g);
                 }
-                using (Graphics g = Graphics.FromImage(bmp))
+                using (Bitmap bmp = Compose(card, scale, SH, W, _cardH, 10))
                 {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.ScaleTransform(scale, scale);
-                    DrawShadow(g);
-                    // карточка со сглаженными скруглёнными углами, пиксель в пиксель
-                    g.ResetTransform();
-                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
-                    g.PixelOffsetMode = PixelOffsetMode.Half;
-                    RectangleF cr = new RectangleF(ox, ox, cw, ch);
-                    using (TextureBrush tb = new TextureBrush(card, WrapMode.Clamp))
-                    using (GraphicsPath p = Round(cr, 10 * scale))
-                    {
-                        tb.TranslateTransform(ox, ox);
-                        g.FillPath(tb, p);
-                    }
-                    cr.Inflate(-0.5f, -0.5f);
-                    using (GraphicsPath p = Round(cr, 10 * scale))
-                    using (Pen pen = new Pen(Theme.Edge, 1f)) g.DrawPath(pen, p);
+                    _drawScale = scale;
+                    Layered.Push(Handle, bmp, Place(bmp.Width, bmp.Height, scale));
                 }
-                _drawScale = scale;
-                Layered.Push(Handle, bmp, Place(bw, bh, scale));
             }
         }
         float _drawScale = 1f;
@@ -2053,21 +2520,43 @@ namespace MonitorTray
             return new Point(x, y);
         }
 
-        // мягкая тень под карточкой
-        void DrawShadow(Graphics g)
+        // Готовая картинка окна (общая для окна и меню трея): мягкая тень, карточка с
+        // ClearType-текстом и сглаженными скруглёнными углами пиксель в пиксель, тонкая рамка.
+        internal static Bitmap Compose(Bitmap card, float scale, float sh, float cardW, float cardH, float radius)
         {
-            RectangleF card = new RectangleF(SH, SH, W, _cardH);
-            int maxA = Ui.DarkTheme ? 9 : 5;
-            for (int i = (int)SH; i >= 1; i--)
+            int ox = (int)Math.Round(sh * scale);
+            Bitmap bmp = new Bitmap(card.Width + 2 * ox, card.Height + 2 * ox, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
             {
-                float k = 1f - i / SH;
-                RectangleF r = card;
-                r.Inflate(i, i);
-                r.Offset(0, 4);
-                using (GraphicsPath p = Round(r, 10 + i))
-                using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(maxA * k * k), 0, 0, 0)))
-                    g.FillPath(b, p);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.ScaleTransform(scale, scale);
+                RectangleF c = new RectangleF(sh, sh, cardW, cardH);
+                int maxA = Ui.DarkTheme ? 9 : 5;
+                for (int i = (int)sh; i >= 1; i--)
+                {
+                    float k = 1f - i / sh;
+                    RectangleF r = c;
+                    r.Inflate(i, i);
+                    r.Offset(0, 4);
+                    using (GraphicsPath p = Round(r, radius + i))
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(maxA * k * k), 0, 0, 0)))
+                        g.FillPath(b, p);
+                }
+                g.ResetTransform();
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                RectangleF cr = new RectangleF(ox, ox, card.Width, card.Height);
+                using (TextureBrush tb = new TextureBrush(card, WrapMode.Clamp))
+                using (GraphicsPath p = Round(cr, radius * scale))
+                {
+                    tb.TranslateTransform(ox, ox);
+                    g.FillPath(tb, p);
+                }
+                cr.Inflate(-0.5f, -0.5f);
+                using (GraphicsPath p = Round(cr, radius * scale))
+                using (Pen pen = new Pen(Theme.Edge, 1f)) g.DrawPath(pen, p);
             }
+            return bmp;
         }
 
         // содержимое карточки; возвращает её высоту
@@ -2082,18 +2571,21 @@ namespace MonitorTray
             float x0 = PAD, x1 = W - PAD, cx = x0 + IND;
             float y = 10;
 
-            // --- верхняя строка: название, кнопка темы и крестик (выход из программы;
-            //     просто спрятать окно — клик мимо него или Esc)
+            // --- верхняя строка: название, кнопка темы и крестик (прячет окно в трей;
+            //     выход — в меню по правому клику на значке)
             RectangleF rClose = new RectangleF(W - 10 - 34, y, 34, 30);
             RectangleF rTheme = new RectangleF(rClose.X - 36, y, 34, 30);
             Add("theme", rTheme, ToggleTheme);
-            Add("close", rClose, delegate { _app.ExitApp(); });
+            Add("close", rClose, HidePopup);
             if (_hover == "theme") Fill(g, rTheme, 6, Theme.Hover);
-            if (_hover == "close") Fill(g, rClose, 6, Color.FromArgb(196, 43, 28)); // красный, как у Windows
+            if (_hover == "close") Fill(g, rClose, 6, Theme.Hover);
             Glyph(g, Ui.DarkTheme ? G_SUN : G_MOON, 14, Theme.TextDim, rTheme);
-            Glyph(g, G_CLOSE, 11, _hover == "close" ? Color.White : Theme.TextDim, rClose);
+            Glyph(g, G_CLOSE, 11, Theme.TextDim, rClose);
             DrawText(g, "MonitorTray", Fonts.Get(Fonts.Medium, 12), Theme.TextDim, new RectangleF(x0, y, 150, 30), FmtL);
             y += 34;
+
+            // --- плашка автообновления
+            if (_app.Updates.Available != null) y = UpdateBanner(g, x0, x1, y);
 
             // --- мониторы
             int active = 0;
@@ -2164,39 +2656,12 @@ namespace MonitorTray
             DrawText(g, Loc.Get("sleep_hint"), Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim, new RectangleF(rs.X + 52, rs.Y + 31, rs.Width - 64, 18), FmtL);
             y += rs.Height + 6;
 
-            // автозапуск — флажок
-            RectangleF ra = new RectangleF(x0, y, x1 - x0, 40);
-            Add("auto", ra, ToggleAuto);
-            if (_hover == "auto") Fill(g, ra, 6, Theme.Hover);
-            RectangleF box = new RectangleF(x0 + 12, ra.Y + 10, 20, 20);
-            if (_auto)
-            {
-                Fill(g, box, 4, Theme.Accent);
-                Glyph(g, G_CHECK, 12, Theme.AccentText, box);
-            }
-            else
-            {
-                using (GraphicsPath p = Round(box, 4))
-                using (Pen pen = new Pen(Theme.TextDim, 1.2f)) g.DrawPath(pen, p);
-            }
-            DrawText(g, Loc.Get("autostart"), Fonts.Get(Fonts.Regular, 13.5f), Theme.Text, new RectangleF(x0 + 44, ra.Y, ra.Width - 50, ra.Height), FmtL);
-            y += ra.Height + 6;
+            // AFK-режим — карточка с переключателем; когда включён, ниже выбор времени
+            y = AfkCard(g, x0, x1, y);
 
-            // язык — выпадающий список (раскрывается прямо в окне)
-            y = LanguageBox(g, x0, x1, y);
 
-            // о программе — ссылка
-            Font fl = Fonts.Get(Fonts.Medium, 13.5f);
-            float lw = g.MeasureString(Loc.Get("about"), fl, PointF.Empty, FmtL).Width;
-            RectangleF rl = new RectangleF(x0 + 4, y + 2, 40 + lw + 8, 34);
-            Add("about", rl, ShowAbout);
-            Color lc = _hover == "about" ? Blend(Theme.Accent, Theme.Text, 0.25f) : Theme.Accent;
-            Glyph(g, G_INFO, 16, lc, new RectangleF(rl.X, rl.Y, 36, rl.Height));
-            DrawText(g, Loc.Get("about"), fl, lc, new RectangleF(rl.X + 40, rl.Y, lw + 6, rl.Height), FmtL);
-            if (_hover == "about")
-                using (Pen pen = new Pen(lc, 1f)) g.DrawLine(pen, rl.X + 40, rl.Y + 25, rl.X + 40 + lw, rl.Y + 25);
-            y += 40;
-            return y + 10;
+
+            return y + 8;
         }
 
         float Section(Graphics g, string glyph, string title, float y, string right)
@@ -2232,7 +2697,8 @@ namespace MonitorTray
             float nx = cx + 34, maxW = x1 - sw - 10 - nx;
             Font fn = Fonts.Get(Fonts.Regular, 14);
             Font fb = Fonts.Get(Fonts.Medium, 11);
-            string badge = !m.Active ? Loc.Get("badge_off") : (m.Primary ? Loc.Get("badge_primary") : null);
+            string badge = !m.Active ? Loc.Get(_app.Afk.IsSleeping(m) ? "badge_afk" : "badge_off")
+                                     : (m.Primary ? Loc.Get("badge_primary") : null);
             float bwid = badge != null ? g.MeasureString(badge, fb, PointF.Empty, FmtL).Width + 16 : 0;
             float tw = g.MeasureString(m.Name, fn, PointF.Empty, FmtL).Width + 2;
             float nameW = Math.Min(tw, maxW - (badge != null ? bwid + 8 : 0));
@@ -2245,10 +2711,13 @@ namespace MonitorTray
                 DrawText(g, badge, fb, bc, rb, FmtC);
             }
 
-            // переключатель Windows 11
-            RectangleF ts = new RectangleF(x1 - sw + 6, y + row.Height / 2 - 10, 40, 20);
-            bool on = m.Active;
-            bool hov = _hover == id;
+            Switch(g, new RectangleF(x1 - sw + 6, y + row.Height / 2 - 10, 40, 20), m.Active, _hover == id, busy);
+            return y + row.Height + 2;
+        }
+
+        // переключатель в стиле Windows 11 (busy — серый, бегунок посередине)
+        internal static void Switch(Graphics g, RectangleF ts, bool on, bool hov, bool busy)
+        {
             if (busy)
             {
                 using (GraphicsPath p = Round(ts, 10))
@@ -2272,7 +2741,110 @@ namespace MonitorTray
                 using (SolidBrush b = new SolidBrush(Theme.TextDim))
                     g.FillEllipse(b, ts.X + 10 - d / 2, ts.Y + 10 - d / 2, d, d);
             }
-            return y + row.Height + 2;
+        }
+
+        // «30 мин», «1 ч», «1 ч 15 мин»
+        static string AfkTime(int mins)
+        {
+            string m = Loc.Get("afk_min"), h = Loc.Get("afk_hour");
+            if (mins < 60) return mins + " " + m;
+            return (mins / 60) + " " + h + (mins % 60 > 0 ? " " + (mins % 60) + " " + m : "");
+        }
+
+        // шаг времени: до 10 мин — по 1, до часа — по 5, дальше — по 15 (максимум 4 часа)
+        static int AfkStep(int v, int dir)
+        {
+            if (dir > 0) v += v < 10 ? 1 : (v < 60 ? 5 : 15);
+            else v -= v <= 10 ? 1 : (v <= 60 ? 5 : 15);
+            return Math.Max(1, Math.Min(240, v));
+        }
+
+        // карточка AFK-режима: заголовок с переключателем, при включении — своё время «− 30 мин +»
+        float AfkCard(Graphics g, float x0, float x1, float y)
+        {
+            bool on = Ui.AfkEnabled;
+            RectangleF head = new RectangleF(x0, y, x1 - x0, 60);
+            RectangleF card = new RectangleF(x0, y, x1 - x0, on ? 100 + _mons.Count * 32 + 6 : 60);
+            Add("afk", head, ToggleAfk);
+            Card(g, card, false);
+            if (_hover == "afk")
+                using (GraphicsPath p = Round(head, 7))
+                using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillPath(b, p);
+            Glyph(g, G_CLOCK, 18, Theme.Accent, new RectangleF(head.X + 6, head.Y, 44, head.Height));
+            float tw = head.Width - 52 - 62;
+            DrawText(g, Loc.Get("afk_title"), Fonts.Get(Fonts.Medium, 14), Theme.Text, new RectangleF(head.X + 52, head.Y + 10, tw, 21), FmtL);
+            DrawText(g, string.Format(Loc.Get("afk_sub"), AfkTime(Ui.AfkMinutes)), Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim,
+                new RectangleF(head.X + 52, head.Y + 31, tw, 18), FmtL);
+            Switch(g, new RectangleF(head.Right - 54, head.Y + 20, 40, 20), on, _hover == "afk", false);
+            if (on)
+            {
+                float cy = head.Y + 62;
+                DrawText(g, Loc.Get("afk_after"), Fonts.Get(Fonts.Regular, 12.5f), Theme.TextDim, new RectangleF(head.X + 52, cy, 60, 28), FmtL);
+                // [−]  1 ч 15 мин  [+]; колесо мыши над ним тоже меняет время
+                float sx = head.X + 112;
+                RectangleF rm = new RectangleF(sx, cy, 30, 28);
+                RectangleF rv = new RectangleF(sx + 32, cy, 96, 28);
+                RectangleF rp = new RectangleF(sx + 130, cy, 30, 28);
+                Add("afk_val", rv, null);
+                Add("afk_minus", rm, delegate { SetAfkMinutes(AfkStep(Ui.AfkMinutes, -1)); });
+                Add("afk_plus", rp, delegate { SetAfkMinutes(AfkStep(Ui.AfkMinutes, 1)); });
+                foreach (RectangleF rb in new RectangleF[] { rm, rp })
+                {
+                    string id = rb == rm ? "afk_minus" : "afk_plus";
+                    if (_hover == id) Fill(g, rb, 14, Theme.Hover);
+                    using (GraphicsPath p = Round(rb, 14))
+                    using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+                }
+                Glyph(g, "\uE738", 11, Theme.Text, rm);   // минус
+                Glyph(g, "\uE710", 11, Theme.Text, rp);   // плюс
+                if (_hover == "afk_val") Fill(g, rv, 14, Theme.Hover);
+                DrawText(g, AfkTime(Ui.AfkMinutes), Fonts.Get(Fonts.Medium, 13), Theme.Text, rv, FmtC);
+
+                // какие мониторы уходят в AFK — у каждого свой переключатель
+                using (Pen pen = new Pen(Theme.Divider, 1f)) g.DrawLine(pen, head.X + 52, head.Y + 97, head.Right - 14, head.Y + 97);
+                float ry = head.Y + 100;
+                for (int i = 0; i < _mons.Count; i++)
+                {
+                    Mon m = _mons[i];
+                    string id = "afkm" + i;
+                    RectangleF rr = new RectangleF(head.X + 44, ry, head.Width - 52, 32);
+                    Add(id, rr, delegate { ToggleAfkMonitor(m); });
+                    if (_hover == id) Fill(g, rr, 6, Theme.Hover);
+                    MonitorIcon(g, new RectangleF(rr.X + 8, ry + 8, 20, 17), i, m.Active);
+                    DrawText(g, m.Name, Fonts.Get(Fonts.Regular, 13), Theme.Text, new RectangleF(rr.X + 36, ry, rr.Width - 36 - 56, 32), FmtL);
+                    Switch(g, new RectangleF(head.Right - 54, ry + 6, 40, 20), Ui.AfkIncluded(m), _hover == id, false);
+                    ry += 32;
+                }
+            }
+            return y + card.Height + 6;
+        }
+
+        // плашка «Доступна версия X» с кнопкой «Обновить» (во время загрузки — проценты)
+        float UpdateBanner(Graphics g, float x0, float x1, float y)
+        {
+            Updater u = _app.Updates;
+            RectangleF r = new RectangleF(x0 - 8, y, x1 - x0 + 16, 54);
+            Fill(g, r, 8, Color.FromArgb(Ui.DarkTheme ? 36 : 20, Theme.Accent));
+            Glyph(g, G_DOWNLOAD, 17, Theme.Accent, new RectangleF(r.X + 4, r.Y, 40, r.Height));
+            string sub = u.Downloading ? string.Format(Loc.Get("upd_progress"), u.Progress)
+                       : (u.Error != null ? Loc.Get("upd_failed") + ": " + u.Error : Loc.Get("upd_sub"));
+            float bw = 0;
+            if (!u.Downloading)
+            {
+                string bt = Loc.Get(u.Error != null ? "upd_open" : "upd_button");
+                Font fbt = Fonts.Get(Fonts.Medium, 12.5f);
+                bw = g.MeasureString(bt, fbt, PointF.Empty, FmtL).Width + 28;
+                RectangleF rb = new RectangleF(r.Right - 12 - bw, r.Y + 13, bw, 28);
+                Add("upd", rb, u.Error != null ? (Action)OpenReleases : (Action)u.Start);
+                Fill(g, rb, 14, _hover == "upd" ? Blend(Theme.Accent, Theme.Text, 0.15f) : Theme.Accent);
+                DrawText(g, bt, fbt, Theme.AccentText, rb, FmtC);
+                bw += 12;
+            }
+            float tx = r.X + 44, tw = r.Right - 12 - bw - tx;
+            DrawText(g, string.Format(Loc.Get("upd_title"), Updater.Pretty(u.Available)), Fonts.Get(Fonts.Medium, 13.5f), Theme.Text,
+                new RectangleF(tx, r.Y + 8, tw, 20), FmtL);
+            DrawText(g, sub, Fonts.Get(Fonts.Regular, 11.5f), Theme.TextDim, new RectangleF(tx, r.Y + 28, tw, 18), FmtL);
+            return y + r.Height + 10;
         }
 
         float Slider(Graphics g, string id, string label, int value, float cx, float x1, float y)
@@ -2305,49 +2877,6 @@ namespace MonitorTray
 
             DrawText(g, value + "%", Fonts.Get(Fonts.Medium, 13), Theme.Text, new RectangleF(x1 - vw, y, vw, 30), FmtR);
             return y + 34;
-        }
-
-        float LanguageBox(Graphics g, float x0, float x1, float y)
-        {
-            float hh = 44, oh = 36;
-            float h = hh + (_langOpen ? 2 * oh + 6 : 0);
-            RectangleF card = new RectangleF(x0, y, x1 - x0, h);
-            RectangleF head = new RectangleF(x0, y, x1 - x0, hh);
-            Add("lang", head, delegate { _langOpen = !_langOpen; Render(); });
-            Card(g, card, false);
-            if (_hover == "lang")
-                using (GraphicsPath p = Round(head, 6))
-                using (SolidBrush b = new SolidBrush(Theme.Hover)) g.FillPath(b, p);
-
-            string cur = Loc.Lang == "ru" ? "Русский" : "English";
-            Glyph(g, G_GLOBE, 16, Theme.TextDim, new RectangleF(x0 + 6, y, 40, hh));
-            DrawText(g, string.Format(Loc.Get("lang_row"), cur), Fonts.Get(Fonts.Regular, 13.5f), Theme.Text,
-                new RectangleF(x0 + 46, y, head.Width - 90, hh), FmtL);
-            Glyph(g, _langOpen ? G_UP : G_DOWN, 11, Theme.TextDim, new RectangleF(x1 - 40, y, 32, hh));
-
-            if (_langOpen)
-            {
-                using (Pen p = new Pen(Theme.Divider, 1f)) g.DrawLine(p, x0 + 1, y + hh, x1 - 1, y + hh);
-                string[] codes = { "en", "ru" };
-                string[] names = { "English", "Русский" };
-                float oy = y + hh + 3;
-                for (int k = 0; k < 2; k++)
-                {
-                    string code = codes[k];
-                    RectangleF ro = new RectangleF(x0 + 4, oy, x1 - x0 - 8, oh);
-                    Add("lang_" + code, ro, delegate { SetLang(code); });
-                    if (_hover == "lang_" + code) Fill(g, ro, 5, Theme.Hover);
-                    if (Loc.Lang == code)
-                    {
-                        Fill(g, new RectangleF(ro.X + 2, ro.Y + 10, 3, ro.Height - 20), 1.5f, Theme.Accent);
-                        Glyph(g, G_CHECK, 12, Theme.Accent, new RectangleF(x1 - 40, oy, 32, oh));
-                    }
-                    DrawText(g, names[k], Fonts.Get(Loc.Lang == code ? Fonts.Medium : Fonts.Regular, 13.5f), Theme.Text,
-                        new RectangleF(x0 + 42, oy, 200, oh), FmtL);
-                    oy += oh;
-                }
-            }
-            return y + h + 2;
         }
 
         string BrightName(BrightEntry b)
@@ -2451,18 +2980,18 @@ namespace MonitorTray
             }
         }
 
-        static void Fill(Graphics g, RectangleF r, float rad, Color c)
+        internal static void Fill(Graphics g, RectangleF r, float rad, Color c)
         {
             using (GraphicsPath p = Round(r, rad))
             using (SolidBrush b = new SolidBrush(c)) g.FillPath(b, p);
         }
 
-        static void DrawText(Graphics g, string s, Font f, Color c, RectangleF r, StringFormat fmt)
+        internal static void DrawText(Graphics g, string s, Font f, Color c, RectangleF r, StringFormat fmt)
         {
             using (SolidBrush b = new SolidBrush(c)) g.DrawString(s, f, b, r, fmt);
         }
 
-        static void Glyph(Graphics g, string glyph, float px, Color c, RectangleF r)
+        internal static void Glyph(Graphics g, string glyph, float px, Color c, RectangleF r)
         {
             // значки — без субпиксельного сглаживания, иначе на тонких линиях цветная кайма
             TextRenderingHint old = g.TextRenderingHint;
@@ -2476,7 +3005,7 @@ namespace MonitorTray
             return Color.FromArgb(255, (int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
         }
 
-        static GraphicsPath Round(RectangleF r, float rad)
+        internal static GraphicsPath Round(RectangleF r, float rad)
         {
             GraphicsPath p = new GraphicsPath();
             float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
@@ -2555,6 +3084,11 @@ namespace MonitorTray
         {
             base.OnMouseWheel(e);
             Hit h = HitAt(ToCard(PointToClient(Cursor.Position)));
+            if (h != null && (h.Id == "afk_val" || h.Id == "afk_minus" || h.Id == "afk_plus"))
+            {
+                SetAfkMinutes(AfkStep(Ui.AfkMinutes, e.Delta > 0 ? 1 : -1));
+                return;
+            }
             if (h == null || !h.Id.StartsWith("s:")) return;
             string id = h.Id.Substring(2);
             int v = (id == "all" ? _allValue : _brights[int.Parse(id.Substring(1))].Value) + (e.Delta > 0 ? 5 : -5);
@@ -2603,7 +3137,6 @@ namespace MonitorTray
         void ToggleSettings()
         {
             Ui.SettingsExpanded = !Ui.SettingsExpanded;
-            _langOpen = false;
             Ui.Save();
             Render();
         }
@@ -2615,18 +3148,42 @@ namespace MonitorTray
             Render();
         }
 
-        void ToggleAuto()
+        void ToggleAfk()
         {
-            try { Autostart.Set(!_auto); } catch { }
-            _auto = Autostart.IsEnabled();
+            Ui.AfkEnabled = !Ui.AfkEnabled;
+            Ui.Save();
+            _app.Afk.Update();
             Render();
         }
 
-        void SetLang(string code)
+        void SetAfkMinutes(int v)
         {
-            Loc.Set(code);
-            _app.UpdateTooltip();
-            _langOpen = false;
+            Ui.AfkMinutes = v;
+            Ui.Save();
+            Render();
+        }
+
+        void OpenReleases()
+        {
+            HidePopup();
+            try { Process.Start(Updater.ReleasesPage); } catch { }
+        }
+
+        // AFK-режим что-то выключил/включил — показать свежее состояние, если окно открыто
+        public void RefreshIfVisible()
+        {
+            if (Visible && !Busy && _drag == null) { Reload(); Render(); }
+        }
+
+        public void RepaintIfVisible()
+        {
+            if (Visible) Render();
+        }
+
+        void ToggleAfkMonitor(Mon m)
+        {
+            Ui.AfkMonitors[Ui.MonKey(m)] = !Ui.AfkIncluded(m);
+            Ui.Save();
             Render();
         }
 
@@ -2659,10 +3216,245 @@ namespace MonitorTray
             t.Start();
         }
 
-        void ShowAbout()
+    }
+
+    // ------------------------------------------------------------------ GUI: меню трея
+    // Меню по правому клику на значке, как в Windows 11: переключатели «Запускать при входе
+    // в Windows» и «Проверять обновления», язык EN | RU, «Открыть MonitorTray», «О программе» и «Выход».
+    // Рисуется так же, как основное окно (тема, ClearType, скругления, тень).
+    internal class TrayMenu : Form
+    {
+        const float W = 300;     // ширина (логические px)
+        const float SH = 14;     // поле под тень
+        const float ROW = 40;
+
+        class Hit { public RectangleF R; public string Id; public Action Click; }
+
+        readonly TrayApp _app;
+        readonly List<Hit> _hits = new List<Hit>();
+        string _hover, _press;
+        bool _auto;
+        float _scale = 1f, _drawScale = 1f, _cardH = 120;
+        Point _at;
+        Rectangle _wa;
+        public int HiddenAt;
+
+        public TrayMenu(TrayApp app)
         {
-            HidePopup();
-            MessageBox.Show(Loc.Get("about_text"), Loc.Get("about"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _app = app;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            KeyPreview = true;
+            Text = "MonitorTray";
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x80000 /*WS_EX_LAYERED*/ | 0x80 /*WS_EX_TOOLWINDOW*/;
+                return cp;
+            }
+        }
+
+        public void ShowAt(Point p)
+        {
+            IntPtr h = Handle;
+            _at = p;
+            _wa = Screen.FromPoint(p).WorkingArea;
+            _scale = Layered.ScaleAt(p);
+            _auto = Autostart.IsEnabled();
+            _hover = _press = null;
+            Render();
+            Show();
+            Activate();
+            Native.SetForegroundWindow(Handle);
+        }
+
+        public void HideMenu()
+        {
+            if (!Visible) return;
+            Hide();
+            HiddenAt = Environment.TickCount;
+            _hover = _press = null;
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            HideMenu();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) HideMenu();
+            base.OnKeyDown(e);
+        }
+
+        void Render()
+        {
+            using (Bitmap tmp = new Bitmap(1, 1))
+            using (Graphics g = Graphics.FromImage(tmp))
+                _cardH = PaintCard(g);
+            int cw = (int)Math.Ceiling(W * _scale), ch = (int)Math.Ceiling(_cardH * _scale);
+            using (Bitmap card = new Bitmap(cw, ch, System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+            {
+                using (Graphics g = Graphics.FromImage(card))
+                {
+                    g.Clear(Theme.Bg);
+                    g.ScaleTransform(_scale, _scale);
+                    PaintCard(g);
+                }
+                using (Bitmap bmp = Popup.Compose(card, _scale, SH, W, _cardH, 8))
+                {
+                    // как меню Windows: над курсором (над панелью задач), не вылезая за рабочую область
+                    int ox = (int)Math.Round(SH * _scale);
+                    int left = Math.Max(_wa.Left + 4, Math.Min(_at.X - cw / 2, _wa.Right - cw - 4));
+                    int bottom = Math.Min(_at.Y, _wa.Bottom) - 8;
+                    int top = bottom - ch;
+                    if (top < _wa.Top) top = Math.Min(_at.Y + 8, _wa.Bottom - ch);
+                    _drawScale = _scale;
+                    Layered.Push(Handle, bmp, new Point(left - ox, top - ox));
+                }
+            }
+        }
+
+        float PaintCard(Graphics g)
+        {
+            _hits.Clear();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            float y = 6;
+            y = ToggleRow(g, "auto", Loc.Get("autostart"), _auto, ToggleAuto, y);
+            y = ToggleRow(g, "upd", Loc.Get("upd_check"), Ui.AutoUpdate, ToggleUpdates, y);
+            y = LangRow(g, y);
+            using (Pen p = new Pen(Theme.Divider, 1f)) g.DrawLine(p, 12, y + 4, W - 12, y + 4);
+            y += 9;
+            y = ItemRow(g, "open", "", Loc.Get("menu_open"), delegate { HideMenu(); _app.OpenPopup(); }, y);
+            y = ItemRow(g, "about", "\uE946", Loc.Get("about"), delegate
+            {
+                HideMenu();
+                MessageBox.Show(Loc.Get("about_text"), Loc.Get("about"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }, y);
+            y = ItemRow(g, "exit", "", Loc.Get("menu_exit"), delegate { HideMenu(); _app.ExitApp(); }, y);
+            return y + 6;
+        }
+
+        // строка с переключателем справа (переключается, меню остаётся открытым)
+        float ToggleRow(Graphics g, string id, string text, bool on, Action click, float y)
+        {
+            RectangleF r = new RectangleF(6, y, W - 12, ROW);
+            Add(id, r, click);
+            if (_hover == id) Popup.Fill(g, r, 6, Theme.Hover);
+            Popup.DrawText(g, text, Fonts.Get(Fonts.Regular, 13.5f), Theme.Text, new RectangleF(r.X + 12, r.Y, r.Width - 76, r.Height), Popup.FmtL);
+            Popup.Switch(g, new RectangleF(r.Right - 52, r.Y + 10, 40, 20), on, _hover == id, false);
+            return y + ROW;
+        }
+
+        // строка «Язык» с переключателем EN | RU справа (язык меняется сразу, меню остаётся)
+        float LangRow(Graphics g, float y)
+        {
+            RectangleF r = new RectangleF(6, y, W - 12, ROW);
+            Popup.DrawText(g, Loc.Get("language"), Fonts.Get(Fonts.Regular, 13.5f), Theme.Text,
+                new RectangleF(r.X + 12, r.Y, r.Width - 120, r.Height), Popup.FmtL);
+            string[] codes = { "en", "ru" }, names = { "EN", "RU" };
+            RectangleF seg = new RectangleF(r.Right - 12 - 92, r.Y + 7, 92, 26);
+            using (GraphicsPath p = Popup.Round(seg, 13))
+            using (Pen pen = new Pen(Theme.Stroke, 1f)) g.DrawPath(pen, p);
+            for (int k = 0; k < 2; k++)
+            {
+                string code = codes[k];
+                string id = "lang_" + code;
+                RectangleF rb = new RectangleF(seg.X + 2 + k * 44, seg.Y + 2, 44, 22);
+                Add(id, rb, delegate { SetLang(code); });
+                bool sel = Loc.Lang == code;
+                if (sel) Popup.Fill(g, rb, 11, Theme.Accent);
+                else if (_hover == id) Popup.Fill(g, rb, 11, Theme.Hover);
+                Popup.DrawText(g, names[k], Fonts.Get(Fonts.Medium, 12), sel ? Theme.AccentText : Theme.Text, rb, Popup.FmtC);
+            }
+            return y + ROW;
+        }
+
+        void SetLang(string code)
+        {
+            if (Loc.Lang == code) return;
+            Loc.Set(code);
+            _app.UpdateTooltip();
+            Render();
+        }
+
+        // строка-команда со значком слева
+        float ItemRow(Graphics g, string id, string glyph, string text, Action click, float y)
+        {
+            RectangleF r = new RectangleF(6, y, W - 12, ROW);
+            Add(id, r, click);
+            if (_hover == id) Popup.Fill(g, r, 6, Theme.Hover);
+            Popup.Glyph(g, glyph, 15, Theme.TextDim, new RectangleF(r.X + 4, r.Y, 34, r.Height));
+            Popup.DrawText(g, text, Fonts.Get(Fonts.Regular, 13.5f), Theme.Text, new RectangleF(r.X + 42, r.Y, r.Width - 50, r.Height), Popup.FmtL);
+            return y + ROW;
+        }
+
+        void Add(string id, RectangleF r, Action click)
+        {
+            Hit h = new Hit();
+            h.Id = id; h.R = r; h.Click = click;
+            _hits.Add(h);
+        }
+
+        Hit HitAt(Point p)
+        {
+            PointF c = new PointF(p.X / _drawScale - SH, p.Y / _drawScale - SH);
+            for (int i = _hits.Count - 1; i >= 0; i--) if (_hits[i].R.Contains(c)) return _hits[i];
+            return null;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            Hit h = HitAt(e.Location);
+            string id = h != null ? h.Id : null;
+            if (id != _hover) { _hover = id; Render(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hover != null) { _hover = null; Render(); }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            Hit h = HitAt(e.Location);
+            _press = h != null ? h.Id : null;
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            Hit h = HitAt(e.Location);
+            string pressed = _press;
+            _press = null;
+            if (h != null && h.Id == pressed && h.Click != null) h.Click();
+        }
+
+        void ToggleAuto()
+        {
+            try { Autostart.Set(!_auto); } catch { }
+            _auto = Autostart.IsEnabled();
+            Render();
+        }
+
+        void ToggleUpdates()
+        {
+            Ui.AutoUpdate = !Ui.AutoUpdate;
+            Ui.Save();
+            if (Ui.AutoUpdate) _app.Updates.Check();
+            Render();
         }
     }
 
@@ -2672,22 +3464,71 @@ namespace MonitorTray
         internal NotifyIcon _icon;
         Icon _appIcon;
         Popup _popup;
+        TrayMenu _menu;
+        readonly Control _ui = new Control();   // для передачи результатов фоновых потоков в UI
+        internal AfkWatcher Afk;
+        internal Updater Updates;
+        Version _announced;                       // о какой версии уже сказали в уведомлении
+        internal static bool JustUpdated;         // запущены после автообновления
 
         public TrayApp()
         {
+            IntPtr h = _ui.Handle; // создать окно-получатель для BeginInvoke
             _appIcon = AppIcon.Create(Ui.DarkTheme);
             _popup = new Popup(this);
+            _menu = new TrayMenu(this);
 
             _icon = new NotifyIcon();
             _icon.Icon = _appIcon;
             _icon.Text = Loc.Get("tray_title");
             _icon.Visible = true;
             _icon.MouseUp += new MouseEventHandler(IconMouseUp);
+            _icon.BalloonTipClicked += delegate { OpenPopup(); };
 
             // смена масштаба экрана — перерисовать значок под новый размер
             SystemEvents.DisplaySettingsChanged += OnSystemChanged;
 
+            Afk = new AfkWatcher(this);
+            Updates = new Updater(this);
+
             UpdateTooltip();
+            if (JustUpdated)
+                _icon.ShowBalloonTip(4000, Loc.Get("tray_title"),
+                    string.Format(Loc.Get("upd_done"), Updater.Pretty(Updater.Current)), ToolTipIcon.Info);
+        }
+
+        // выполнить в UI-потоке (из фоновых потоков автообновления)
+        internal void Post(MethodInvoker a)
+        {
+            try { _ui.BeginInvoke(a); } catch { }
+        }
+
+        // окно открыто или в нём идёт переключение — AFK-режим ждёт
+        internal bool PopupBusy { get { return _popup.Visible || _popup.Busy; } }
+
+        // AFK-режим выключил или включил монитор
+        internal void OnAfkChanged(string name, bool off)
+        {
+            UpdateTooltip();
+            _popup.RefreshIfVisible();
+            if (off && !Ui.AfkHintShown)
+            {
+                Ui.AfkHintShown = true;
+                Ui.Save();
+                _icon.ShowBalloonTip(8000, Loc.Get("tray_title"), string.Format(Loc.Get("afk_off_hint"), name), ToolTipIcon.Info);
+            }
+        }
+
+        // у автообновления новости: нашлась версия, идёт загрузка, ошибка
+        internal void OnUpdateChanged(bool found)
+        {
+            if (found && Updates.Available != null && Updates.Available != _announced)
+            {
+                _announced = Updates.Available;
+                _icon.ShowBalloonTip(6000, Loc.Get("tray_title"),
+                    string.Format(Loc.Get("upd_balloon"), Updater.Pretty(Updates.Available)), ToolTipIcon.Info);
+            }
+            _popup.RepaintIfVisible();
         }
 
         void OnSystemChanged(object sender, EventArgs e) { RefreshIcon(); }
@@ -2715,17 +3556,33 @@ namespace MonitorTray
             catch { }
         }
 
+        // левый клик — окно, правый — меню (автозапуск, обновления, выход)
         void IconMouseUp(object sender, MouseEventArgs e)
         {
-            if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
+            if (e.Button == MouseButtons.Right)
+            {
+                _popup.HidePopup();
+                if (_menu.Visible) { _menu.HideMenu(); return; }
+                if (unchecked(Environment.TickCount - _menu.HiddenAt) < 300) return;
+                _menu.ShowAt(Cursor.Position);
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
+            _menu.HideMenu();
             if (_popup.Visible) { _popup.HidePopup(); return; }
             // это же нажатие только что закрыло окно (оно теряет фокус раньше, чем приходит MouseUp)
             if (unchecked(Environment.TickCount - _popup.HiddenAt) < 300) return;
             _popup.ShowNearTray();
         }
 
+        internal void OpenPopup()
+        {
+            if (!_popup.Visible) _popup.ShowNearTray();
+        }
+
         internal void Toggle(Mon m)
         {
+            Afk.Forget(m); // включили/выключили вручную — AFK-режим этот монитор больше не ведёт
             int hr;
             if (m.Active)
             {
@@ -2750,6 +3607,8 @@ namespace MonitorTray
         internal void ExitApp()
         {
             _popup.HidePopup();
+            _menu.HideMenu();
+            Afk.WakeAll(); // не оставлять мониторы выключенными после выхода
             SystemEvents.DisplaySettingsChanged -= OnSystemChanged;
             _icon.Visible = false;
             _icon.Dispose();
@@ -2877,6 +3736,17 @@ namespace MonitorTray
             Loc.Load();
             Ui.Load();
             Fonts.Load();
+
+            // перезапуск после автообновления: дождаться выхода старой версии и убрать её файл
+            if (args != null && args.Length > 0 && args[0] == "--updated")
+            {
+                int pid;
+                if (args.Length > 1 && int.TryParse(args[1], out pid))
+                    try { Process.GetProcessById(pid).WaitForExit(10000); } catch { }
+                try { File.Delete(Application.ExecutablePath + ".old"); } catch { }
+                TrayApp.JustUpdated = true;
+                args = new string[0];
+            }
 
             if (args != null && args.Length > 0)
             {
