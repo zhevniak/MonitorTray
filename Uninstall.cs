@@ -5,8 +5,10 @@ using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Runtime.InteropServices;
 
 using System.Reflection;
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 [assembly: AssemblyTitle("MonitorTray Uninstaller")]
 [assembly: AssemblyDescription("Uninstaller for MonitorTray")]
 [assembly: AssemblyConfiguration("")]
@@ -15,21 +17,29 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.1.0")]
+[assembly: AssemblyFileVersion("1.4.1.0")]
 
 namespace MonitorTraySetup
 {
     internal static class Uninstall
     {
+        [DllImport("kernel32.dll")]
+        static extern bool SetDefaultDllDirectories(uint flags);
+
         [STAThread]
         static void Main()
         {
+            // библиотеки — только из System32 (защита от подложенных рядом DLL)
+            try { SetDefaultDllDirectories(0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); } catch { }
             bool ru;
             try { ru = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ru"; }
             catch { ru = false; }
 
-            string dir = AppDomain.CurrentDomain.BaseDirectory;
+            // Удаляем только папку установки. Раньше удалялась папка, где лежит Uninstall.exe, —
+            // запущенный, скажем, с рабочего стола, он стёр бы весь рабочий стол.
+            string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Programs", "MonitorTray");
             DialogResult r = MessageBox.Show(
                 ru ? "Удалить MonitorTray с этого компьютера?" : "Remove MonitorTray from this computer?",
                 ru ? "Удаление MonitorTray" : "Remove MonitorTray",
@@ -53,10 +63,11 @@ namespace MonitorTraySetup
 
             TryDelete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "MonitorTray.lnk"));
             TryDelete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "MonitorTray.lnk"));
-            TryDelete(Path.Combine(dir, "MonitorTray.exe"));
+            TryDelete(Path.Combine(installDir, "MonitorTray.exe"));
 
-            // сам деинсталлятор и его папку удаляет отложенная команда после выхода
-            Process.Start("cmd.exe", "/c timeout /t 2 >nul & rd /s /q \"" + dir + "\"");
+            // папку установки (вместе с самим деинсталлятором) удаляет отложенная команда после выхода
+            if (Directory.Exists(installDir))
+                Process.Start("cmd.exe", "/c timeout /t 2 >nul & rd /s /q \"" + installDir + "\"");
         }
 
         static void TryDelete(string path)

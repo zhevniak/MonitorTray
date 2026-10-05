@@ -9,7 +9,9 @@ using System.IO;
 using System.Reflection;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Runtime.InteropServices;
 
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 [assembly: AssemblyTitle("MonitorTray Setup")]
 [assembly: AssemblyDescription("Installer for MonitorTray - monitor power control from the Windows tray")]
 [assembly: AssemblyConfiguration("")]
@@ -18,8 +20,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.1.0")]
+[assembly: AssemblyFileVersion("1.4.1.0")]
 
 namespace MonitorTraySetup
 {
@@ -37,9 +39,14 @@ namespace MonitorTraySetup
                 "Programs", "MonitorTray");
         }
 
+        [DllImport("kernel32.dll")]
+        static extern bool SetDefaultDllDirectories(uint flags);
+
         [STAThread]
         static void Main(string[] args)
         {
+            // установщик часто запускают из «Загрузок» — библиотеки берём только из System32
+            try { SetDefaultDllDirectories(0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); } catch { }
             Application.EnableVisualStyles();
             string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             if (mode == "silent")
@@ -93,7 +100,7 @@ namespace MonitorTraySetup
                 @"Software\Microsoft\Windows\CurrentVersion\Uninstall\MonitorTray"))
             {
                 k.SetValue("DisplayName", "MonitorTray");
-                k.SetValue("DisplayVersion", "1.4");
+                k.SetValue("DisplayVersion", "1.4.1");
                 k.SetValue("DisplayIcon", exe);
                 k.SetValue("UninstallString", Path.Combine(dir, "Uninstall.exe"));
                 k.SetValue("InstallLocation", dir);

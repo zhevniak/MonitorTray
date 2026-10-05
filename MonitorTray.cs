@@ -23,6 +23,9 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 using System.Reflection;
+// системные библиотеки (dxva2, shcore, powrprof, dwmapi…) — только из System32, а не из папки
+// рядом с exe: портативный exe часто лежит в «Загрузках», куда легко подложить чужую DLL
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 [assembly: AssemblyTitle("MonitorTray")]
 [assembly: AssemblyDescription("Turn individual monitors on/off from the Windows tray (no DDC/CI needed)")]
 [assembly: AssemblyConfiguration("")]
@@ -31,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.1.0")]
+[assembly: AssemblyFileVersion("1.4.1.0")]
 
 namespace MonitorTray
 {
@@ -1821,8 +1824,8 @@ namespace MonitorTray
                     ? "MonitorTray уже запущен — значок есть в области уведомлений (возможно, под стрелкой «^»)."
                     : "MonitorTray is already running — the icon is in the notification area (possibly under the \"^\" arrow).";
                 case "about_text": return ru
-                    ? "MonitorTray 1.4\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
-                    : "MonitorTray 1.4\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
+                    ? "MonitorTray 1.4.1\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
+                    : "MonitorTray 1.4.1\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
                 default: return key;
             }
         }
@@ -2691,6 +2694,8 @@ namespace MonitorTray
     {
         internal static string ApiUrl = "https://api.github.com/repos/zhevniak/MonitorTray/releases/latest";
         public const string ReleasesPage = "https://github.com/zhevniak/MonitorTray/releases/latest";
+        // скачивать можно только файлы релизов этого репозитория
+        internal static string DownloadPrefix = "https://github.com/zhevniak/MonitorTray/releases/download/";
 
         public Version Available;        // новая версия, если нашлась
         public bool Downloading;
@@ -2766,6 +2771,8 @@ namespace MonitorTray
                 {
                     string url, sumsUrl;
                     if (!assets.TryGetValue(name, out url) || !assets.TryGetValue("SHA256SUMS.txt", out sumsUrl))
+                        throw new Exception(Loc.Get("upd_nofile"));
+                    if (!url.StartsWith(DownloadPrefix, StringComparison.Ordinal) || !sumsUrl.StartsWith(DownloadPrefix, StringComparison.Ordinal))
                         throw new Exception(Loc.Get("upd_nofile"));
                     Match sm = Regex.Match(Get(sumsUrl), "([0-9a-fA-F]{64})\\s+\\*?" + Regex.Escape(name) + "\\s*$", RegexOptions.Multiline);
                     if (!sm.Success) throw new Exception(Loc.Get("upd_nofile"));
@@ -4546,9 +4553,13 @@ namespace MonitorTray
     // ------------------------------------------------------------------ entry
     internal static class Program
     {
+        [DllImport("kernel32.dll")]
+        static extern bool SetDefaultDllDirectories(uint flags);
+
         [STAThread]
         static void Main(string[] args)
         {
+            try { SetDefaultDllDirectories(0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); } catch { }
             Loc.Load();
             Ui.Load();
             Fonts.Load();
