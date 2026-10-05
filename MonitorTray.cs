@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.4.1.0")]
-[assembly: AssemblyFileVersion("1.4.1.0")]
+[assembly: AssemblyVersion("1.4.2.0")]
+[assembly: AssemblyFileVersion("1.4.2.0")]
 
 namespace MonitorTray
 {
@@ -1824,8 +1824,8 @@ namespace MonitorTray
                     ? "MonitorTray уже запущен — значок есть в области уведомлений (возможно, под стрелкой «^»)."
                     : "MonitorTray is already running — the icon is in the notification area (possibly under the \"^\" arrow).";
                 case "about_text": return ru
-                    ? "MonitorTray 1.4.1\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
-                    : "MonitorTray 1.4.1\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
+                    ? "MonitorTray 1.4.2\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
+                    : "MonitorTray 1.4.2\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
                 default: return key;
             }
         }
@@ -2430,13 +2430,128 @@ namespace MonitorTray
         }
     }
 
+    // ------------------------------------------------------------------ какие программы играют звук
+    // Core Audio: сессии воспроизведения на всех устройствах вывода и их громкость прямо сейчас.
+    // Нужно AFK-режиму, чтобы понять, на каком мониторе идёт видео (у видео почти всегда есть звук).
+    internal static class CoreAudio
+    {
+        [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+        class MMDeviceEnumeratorCom { }
+
+        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IMMDeviceEnumerator
+        {
+            [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+        }
+
+        [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IMMDeviceCollection
+        {
+            [PreserveSig] int GetCount(out int count);
+            [PreserveSig] int Item(int index, out IMMDevice device);
+        }
+
+        [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IMMDevice
+        {
+            [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        }
+
+        [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IAudioSessionManager2
+        {
+            [PreserveSig] int GetAudioSessionControl(IntPtr sessionGuid, int streamFlags, out IntPtr control);
+            [PreserveSig] int GetSimpleAudioVolume(IntPtr sessionGuid, int streamFlags, out IntPtr volume);
+            [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator sessions);
+        }
+
+        [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IAudioSessionEnumerator
+        {
+            [PreserveSig] int GetCount(out int count);
+            [PreserveSig] int GetSession(int index, out IAudioSessionControl2 session);
+        }
+
+        [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IAudioSessionControl2
+        {
+            [PreserveSig] int GetState(out int state);                       // IAudioSessionControl
+            [PreserveSig] int GetDisplayName(out IntPtr name);
+            [PreserveSig] int SetDisplayName(IntPtr name, IntPtr context);
+            [PreserveSig] int GetIconPath(out IntPtr path);
+            [PreserveSig] int SetIconPath(IntPtr path, IntPtr context);
+            [PreserveSig] int GetGroupingParam(out Guid param);
+            [PreserveSig] int SetGroupingParam(ref Guid param, IntPtr context);
+            [PreserveSig] int RegisterAudioSessionNotification(IntPtr client);
+            [PreserveSig] int UnregisterAudioSessionNotification(IntPtr client);
+            [PreserveSig] int GetSessionIdentifier(out IntPtr id);           // IAudioSessionControl2
+            [PreserveSig] int GetSessionInstanceIdentifier(out IntPtr id);
+            [PreserveSig] int GetProcessId(out uint pid);
+        }
+
+        [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IAudioMeterInformation
+        {
+            [PreserveSig] int GetPeakValue(out float peak);
+        }
+
+        // имена программ (как «chrome», «vlc»), которые прямо сейчас что-то слышно играют
+        public static List<string> AudibleProcesses()
+        {
+            List<string> res = new List<string>();
+            try
+            {
+                IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+                IMMDeviceCollection devs;
+                if (en.EnumAudioEndpoints(0 /*eRender*/, 1 /*DEVICE_STATE_ACTIVE*/, out devs) != 0) return res;
+                int n;
+                devs.GetCount(out n);
+                Guid iid = typeof(IAudioSessionManager2).GUID;
+                for (int i = 0; i < n; i++)
+                {
+                    IMMDevice dev;
+                    object o;
+                    IAudioSessionEnumerator se;
+                    if (devs.Item(i, out dev) != 0) continue;
+                    if (dev.Activate(ref iid, 23 /*CLSCTX_ALL*/, IntPtr.Zero, out o) != 0) continue;
+                    if (((IAudioSessionManager2)o).GetSessionEnumerator(out se) != 0) continue;
+                    int cnt;
+                    se.GetCount(out cnt);
+                    for (int k = 0; k < cnt; k++)
+                    {
+                        IAudioSessionControl2 ses;
+                        if (se.GetSession(k, out ses) != 0 || ses == null) continue;
+                        int state;
+                        uint pid;
+                        float peak = 0;
+                        if (ses.GetState(out state) != 0 || state != 1 /*AudioSessionStateActive*/) continue;
+                        IAudioMeterInformation meter = ses as IAudioMeterInformation;
+                        if (meter == null || meter.GetPeakValue(out peak) != 0 || peak < 0.005f) continue;
+                        ses.GetProcessId(out pid);
+                        string name = ProcessName(pid);
+                        if (name != null && !res.Contains(name)) res.Add(name);
+                    }
+                }
+            }
+            catch { }
+            return res;
+        }
+
+        public static string ProcessName(uint pid)
+        {
+            if (pid == 0) return null;
+            try { using (Process p = Process.GetProcessById((int)pid)) return p.ProcessName; }
+            catch { return null; }
+        }
+    }
+
     // ------------------------------------------------------------------ AFK-режим
     // Монитор, на который курсор не заходил N минут, выключается (как кнопкой в окне).
     // Включается обратно: «толчком» мыши в край экрана, за которым он был, кликом в окне,
     // а если выключился, пока за ПК никого не было, — при первом же движении или нажатии.
     // Мониторы выбираются в окне (по умолчанию — все, кроме основного). Не гасит монитор с курсором,
-    // последний включённый, монитор с полноэкранным окном и не срабатывает, пока какая-нибудь
-    // программа (видеоплеер, браузер с видео) просит не гасить экран.
+    // последний включённый, монитор с полноэкранным окном и монитор, на котором идёт видео
+    // (если программа просит не гасить экран — смотрим, где её окно; остальные мониторы гаснут).
     internal class AfkWatcher : NativeWindow
     {
         class Sleeper { public string Key, Name, Gdi; public Rectangle Bounds; public bool WakeOnInput; public int At; }
@@ -2453,6 +2568,7 @@ namespace MonitorTray
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint n, uint size);
         [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr h, uint cmd, IntPtr data, ref uint size, uint headerSize);
 
@@ -2463,6 +2579,7 @@ namespace MonitorTray
         readonly Dictionary<string, int> _seen = new Dictionary<string, int>(); // экран → когда там был курсор
         readonly List<Sleeper> _sleepers = new List<Sleeper>();
         readonly uint _pid = (uint)Process.GetCurrentProcess().Id;
+        readonly Dictionary<string, int> _audible = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase); // программа → когда звучала
         Sleeper _pushTarget;
         int _pushDir, _pushSum, _pushAt;
         bool _raw;
@@ -2527,12 +2644,15 @@ namespace MonitorTray
             if (Ui.AfkEnabled)
             {
                 Point p = Cursor.Position;
-                bool hold = _app.PopupBusy || DisplayRequired();
+                bool hold = _app.PopupBusy;
+                // кто-то просит не гасить экран (видео, игра) — бережём только тот монитор, где это идёт
+                HashSet<string> busy = DisplayRequired() ? VideoScreens(screens) : null;
                 int limit = Ui.AfkMinutes * 60000;
                 foreach (Screen sc in screens)
                 {
                     int t;
-                    if (hold || sc.Bounds.Contains(p) || _app.Sleep.IsAsleepGdi(sc.DeviceName) || !_seen.TryGetValue(sc.DeviceName, out t))
+                    if (hold || sc.Bounds.Contains(p) || _app.Sleep.IsAsleepGdi(sc.DeviceName) ||
+                        (busy != null && busy.Contains(sc.DeviceName)) || !_seen.TryGetValue(sc.DeviceName, out t))
                     {
                         _seen[sc.DeviceName] = now;
                         continue;
@@ -2593,6 +2713,51 @@ namespace MonitorTray
                 return CallNtPowerInformation(16 /*SystemExecutionState*/, IntPtr.Zero, 0, out state, 4) == 0 && (state & 0x2) != 0;
             }
             catch { return false; }
+        }
+
+        // На каких мониторах идёт видео. Windows говорит лишь, что «кто-то просит не гасить экран»,
+        // но не где. Ищем окна программ, которые сейчас играют звук (браузер, плеер, игра) — их
+        // мониторы и бережём. Звука нет (видео без звука, презентация) — бережём монитор активного окна.
+        HashSet<string> VideoScreens(Screen[] screens)
+        {
+            int now = Environment.TickCount;
+            foreach (string exe in CoreAudio.AudibleProcesses()) _audible[exe] = now;
+            HashSet<string> playing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, int> kv in _audible)
+                if (unchecked(now - kv.Value) < 20000) playing.Add(kv.Key); // короткая тишина в видео — не повод
+            HashSet<string> result = new HashSet<string>();
+            if (playing.Count > 0)
+            {
+                Dictionary<uint, string> names = new Dictionary<uint, string>();
+                Native.EnumWindows(delegate(IntPtr h, IntPtr lp)
+                {
+                    if (!Native.IsWindowVisible(h) || IsIconic(h)) return true;
+                    int cloaked;
+                    if (Native.DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, out cloaked, 4) == 0 && cloaked != 0) return true;
+                    RECT r;
+                    if (!GetWindowRect(h, out r) || r.Right - r.Left < 200 || r.Bottom - r.Top < 150) return true;
+                    uint pid;
+                    GetWindowThreadProcessId(h, out pid);
+                    if (pid == _pid) return true;
+                    string name;
+                    if (!names.TryGetValue(pid, out name)) { name = CoreAudio.ProcessName(pid); names[pid] = name; }
+                    if (name == null || !playing.Contains(name)) return true;
+                    Point c = new Point((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+                    foreach (Screen sc in screens) if (sc.Bounds.Contains(c)) result.Add(sc.DeviceName);
+                    return true;
+                }, IntPtr.Zero);
+            }
+            if (result.Count == 0)
+            {
+                IntPtr fg = GetForegroundWindow();
+                RECT r;
+                if (fg != IntPtr.Zero && GetWindowRect(fg, out r))
+                {
+                    Point c = new Point((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+                    foreach (Screen sc in screens) if (sc.Bounds.Contains(c)) result.Add(sc.DeviceName);
+                }
+            }
+            return result;
         }
 
         // окно на весь монитор (не развёрнутое, а именно полноэкранное: игра, видео, F11)
@@ -2800,7 +2965,8 @@ namespace MonitorTray
             {
                 if (installed)
                 {
-                    Process.Start(file, "update"); // установщик сам закроет программу и запустит новую
+                    // тихая установка (Inno Setup): закроет программу, заменит файл и запустит новую версию
+                    Process.Start(file, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
                     _app.ExitApp();
                     return;
                 }
@@ -4232,6 +4398,8 @@ namespace MonitorTray
         internal Updater Updates;
         Version _announced;                       // о какой версии уже сказали в уведомлении
         internal static bool JustUpdated;         // запущены после автообновления
+        internal const string ExitEventName = "Local\\MonitorTrayExit"; // сигнал «закройся» (MonitorTray.exe --exit)
+        EventWaitHandle _exitEvent;
 
         public TrayApp()
         {
@@ -4252,6 +4420,14 @@ namespace MonitorTray
 
             Sleep = new MonitorSleep(this);
             Afk = new AfkWatcher(this);
+
+            // установщик просит закрыться (перед обновлением или удалением) — выходим как по «Выход»
+            try
+            {
+                _exitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ExitEventName);
+                ThreadPool.RegisterWaitForSingleObject(_exitEvent, delegate { Post(ExitApp); }, null, -1, true);
+            }
+            catch { }
             Updates = new Updater(this);
 
             UpdateTooltip();
@@ -4563,6 +4739,20 @@ namespace MonitorTray
             Loc.Load();
             Ui.Load();
             Fonts.Load();
+
+            // --exit: попросить запущенную копию закрыться самой (разбудив мониторы) — так делает
+            // установщик перед обновлением и удалением; ждём до 5 с, пока она выйдет
+            if (args != null && args.Length > 0 && args[0] == "--exit")
+            {
+                try { using (EventWaitHandle ev = EventWaitHandle.OpenExisting(TrayApp.ExitEventName)) ev.Set(); } catch { }
+                for (int i = 0; i < 50; i++)
+                {
+                    bool none;
+                    using (Mutex probe = new Mutex(false, "Local\\MonitorTraySingleInstance", out none)) if (none) break;
+                    Thread.Sleep(100);
+                }
+                return;
+            }
 
             // перезапуск после автообновления: дождаться выхода старой версии и убрать её файл
             if (args != null && args.Length > 0 && args[0] == "--updated")

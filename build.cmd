@@ -11,13 +11,16 @@ rem --- основная программа (шрифт Roboto встраива�
 "%CSC%" /nologo /codepage:65001 /target:winexe /win32icon:MonitorTray.ico /win32manifest:app.manifest /res:fonts\Roboto-Regular.ttf.gz,Roboto-Regular.ttf.gz /res:fonts\Roboto-Medium.ttf.gz,Roboto-Medium.ttf.gz /res:fonts\Roboto-SemiBold.ttf.gz,Roboto-SemiBold.ttf.gz /out:MonitorTray.exe %REF% MonitorTray.cs
 if errorlevel 1 exit /b 1
 
-rem --- деинсталлятор (промежуточный файл) ---
-if not exist build mkdir build
-"%CSC%" /nologo /codepage:65001 /target:winexe /win32icon:MonitorTray.ico /out:build\Uninstall.exe /r:System.dll /r:System.Windows.Forms.dll Uninstall.cs
-if errorlevel 1 exit /b 1
-
-rem --- установщик (упаковывает программу и деинсталлятор внутрь себя) ---
-"%CSC%" /nologo /codepage:65001 /target:winexe /win32icon:MonitorTray.ico /out:MonitorTraySetup.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /res:MonitorTray.exe,MonitorTray.exe /res:build\Uninstall.exe,Uninstall.exe Setup.cs
+rem --- установщик (Inno Setup): собирается, если найден ISCC.exe ---
+set ISCC=
+if exist "build\inno\ISCC.exe" set ISCC=build\inno\ISCC.exe
+if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe
+if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe
+if not defined ISCC (
+  echo Build OK: MonitorTray.exe  ^(Inno Setup not found - installer skipped^)
+  exit /b 0
+)
+"%ISCC%" /Q installer.iss
 if errorlevel 1 exit /b 1
 
 echo Build OK: MonitorTray.exe + MonitorTraySetup.exe

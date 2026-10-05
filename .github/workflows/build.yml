@@ -15,9 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # установщик собирается Inno Setup (https://jrsoftware.org/isinfo.php)
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+
       - name: Build
         shell: cmd
         run: build.cmd
+
+      - name: Check the installer was built
+        shell: pwsh
+        run: if (-not (Test-Path MonitorTraySetup.exe)) { throw "MonitorTraySetup.exe was not built" }
 
       - name: Make portable zip
         shell: pwsh

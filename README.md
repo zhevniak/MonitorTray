@@ -58,7 +58,7 @@ Got a second monitor that you only use sometimes, but it keeps glowing in the co
 Get it from the [Releases](../../releases/latest) page:
 
 - **`MonitorTray.exe`** (recommended): portable, just run it. To start it with Windows, right-click the tray icon and turn on *Start with Windows*
-- **`MonitorTraySetup.exe`**: installs per-user, adds Start-menu / desktop shortcuts and an entry in *Settings → Apps*
+- **`MonitorTraySetup.exe`**: a standard Inno Setup installer; installs per-user (no admin rights), adds Start-menu / desktop shortcuts and an entry in *Settings → Apps*
 
 Updates arrive by themselves: when a new version is out, a banner appears in the window, and one click installs it.
 
@@ -180,12 +180,12 @@ No Visual Studio or SDK needed; the script uses the C# compiler that ships with 
 build.cmd
 ```
 
-It produces `MonitorTray.exe` and `MonitorTraySetup.exe` (an installer with the app and the uninstaller inside).
+It builds `MonitorTray.exe`; if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed, it also builds the installer `MonitorTraySetup.exe`.
 
 | File | What it is |
 |---|---|
 | `MonitorTray.cs` | the whole app: display control, DDC/CI, window, tray, CLI (C# 5) |
-| `Setup.cs`, `Uninstall.cs` | installer and uninstaller |
+| `installer.iss` | installer script (Inno Setup): per-user install, shortcuts, optional autostart, uninstall |
 | `fonts/` | Roboto (Regular / Medium / SemiBold, Latin + Cyrillic), embedded into the exe |
 | `MonitorTray.ico`, `app.manifest` | app icon and manifest (per-monitor DPI aware) |
 | `docs/` | images for this README |
