@@ -62,6 +62,8 @@ Get it from the [Releases](../../releases/latest) page:
 
 Updates arrive by themselves: when a new version is out, a banner appears in the window, and one click installs it.
 
+Release files are built by GitHub Actions from this repository and published with SHA-256 checksums. Code signing is provided by the [SignPath Foundation](https://signpath.org) — see the [code signing policy](#code-signing-policy).
+
 ## How to use
 
 - **Left-click** the tray icon to open the window. **Right-click** for *Start with Windows*, *Check for updates*, *Language*, *About* and *Exit*
@@ -190,6 +192,21 @@ It builds `MonitorTray.exe`; if [Inno Setup 6](https://jrsoftware.org/isinfo.php
 | `MonitorTray.ico`, `app.manifest` | app icon and manifest (per-monitor DPI aware) |
 | `docs/` | images for this README |
 | `.github/workflows/build.yml` | builds every push; for `v*` tags publishes a release with `SHA256SUMS.txt` (used by the auto-updater) |
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). The application has been submitted; until the certificate is issued, release files are not signed yet.
+
+- **Committers and reviewers:** [@zhevniak](https://github.com/zhevniak)
+- **Approvers:** [@zhevniak](https://github.com/zhevniak)
+
+Only files built by GitHub Actions from this repository are signed: `MonitorTray.exe` and `MonitorTraySetup.exe` of each tagged release.
+
+## Privacy policy
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+
+The only network connection MonitorTray makes is the update check: once a day it asks the GitHub Releases API (`api.github.com`) which version is the latest, and when you press **Update**, it downloads the new version from GitHub. The check can be turned off in the tray icon's right-click menu (*Check for updates*). No personal data, telemetry or usage statistics are collected or sent. Settings are stored only on your computer, in `%APPDATA%\MonitorTray_*.txt`.
 
 ## License
 
