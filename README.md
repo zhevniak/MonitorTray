@@ -77,7 +77,7 @@ Release files are built by GitHub Actions from this repository and published wit
 
 MonitorTray picks the best way for each monitor by itself:
 
-- **Sleep** (badge *Sleep*): for monitors that support the DDC/CI power command. Windows doesn't rebuild the desktop, so other screens don't blink and windows stay where they are. The monitor wakes up when you move the cursor onto it, or with its switch
+- **Sleep** (badge *Sleep*): for monitors that support the DDC/CI power command. Windows doesn't rebuild the desktop, so other screens don't blink and windows stay where they are. The monitor wakes up when you move the cursor onto it, or with its switch. Some monitors (LG UltraGear among them) list this command but ignore it: MonitorTray sees that the monitor is still on, disconnects it instead and remembers that for next time
 - **Disconnect** (badge *Off*): for all other monitors, the same as *Disconnect this display* in Windows. The monitor loses signal; its windows move to the other screens and come back when it's turned on again
 - Turning off the **last** monitor that is on is blocked, so you never end up with a black screen
 </details>

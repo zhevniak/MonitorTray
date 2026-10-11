@@ -34,8 +34,8 @@ using System.Reflection;
 [assembly: AssemblyCopyright("Copyright (c) 2026 MonitorTray contributors (MIT)")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("1.4.2.0")]
-[assembly: AssemblyFileVersion("1.4.2.0")]
+[assembly: AssemblyVersion("1.4.3.0")]
+[assembly: AssemblyFileVersion("1.4.3.0")]
 
 namespace MonitorTray
 {
@@ -1824,8 +1824,8 @@ namespace MonitorTray
                     ? "MonitorTray уже запущен — значок есть в области уведомлений (возможно, под стрелкой «^»)."
                     : "MonitorTray is already running — the icon is in the notification area (possibly under the \"^\" arrow).";
                 case "about_text": return ru
-                    ? "MonitorTray 1.4.2\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
-                    : "MonitorTray 1.4.2\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
+                    ? "MonitorTray 1.4.3\n\nВключение и выключение отдельных мониторов прямо из трея —\nтем же способом, что и «Параметры экрана» Windows (без DDC/CI).\n\nНажмите на значок в трее и щёлкните по монитору,\nчтобы выключить или включить его.\n\nУдаление: Параметры Windows → Приложения → MonitorTray."
+                    : "MonitorTray 1.4.3\n\nTurn individual monitors on and off right from the tray —\nthe same way Windows Display Settings does it (no DDC/CI needed).\n\nClick the tray icon, then click a monitor\nto turn it off or on.\n\nUninstall: Windows Settings → Apps → MonitorTray.";
                 default: return key;
             }
         }
@@ -2277,10 +2277,13 @@ namespace MonitorTray
     // Монитор, который понимает команду питания DDC/CI, выключается «сном»: Windows ничего не
     // перестраивает, поэтому остальные экраны не мигают (на NVIDIA с G-SYNC при отключении мигают),
     // а окна остаются на своих местах. Просыпается, когда на него заходит курсор, или по кнопке в окне.
-    // Мониторы без этой команды выключаются как раньше — отключением.
+    // Мониторы без этой команды выключаются как раньше — отключением. Некоторые мониторы (LG UltraGear)
+    // заявляют команду, но не засыпают: такой сразу отвечает «включён» — его отключаем и запоминаем это.
     internal class MonitorSleep
     {
-        class Asleep { public string Key, Gdi, Name; public Rectangle Bounds; public bool Afk, CursorLeft; }
+        class Asleep { public string Key, Gdi, Name; public Rectangle Bounds; public bool Afk, CursorLeft; public int At; }
+
+        const int VerifyMs = 10000; // проснулся раньше — значит, и не засыпал
 
         readonly TrayApp _app;
         readonly List<Asleep> _asleep = new List<Asleep>();
@@ -2362,6 +2365,7 @@ namespace MonitorTray
             Asleep a = new Asleep();
             a.Key = Ui.MonKey(m); a.Gdi = m.GdiName; a.Name = m.Name; a.Bounds = m.Bounds; a.Afk = afk;
             a.CursorLeft = !m.Bounds.Contains(Cursor.Position);
+            a.At = Environment.TickCount;
             _asleep.Add(a);
             _ticks = 0;
             _timer.Start();
@@ -2410,7 +2414,7 @@ namespace MonitorTray
                 if (!inside) a.CursorLeft = true;
                 else if (a.CursorLeft) Wake(a, true);
             }
-            // раз в 3 с: не разбудили ли монитор его собственной кнопкой
+            // раз в 3 с: не разбудили ли монитор его собственной кнопкой и уснул ли он вообще
             if (++_ticks % 15 != 0 || _checking || _asleep.Count == 0) return;
             _checking = true;
             Asleep[] list = _asleep.ToArray();
@@ -2422,8 +2426,12 @@ namespace MonitorTray
                 {
                     _checking = false;
                     if (awake.Count == 0) return;
-                    _asleep.RemoveAll(x => awake.Contains(x.Key));
+                    // пока шла проверка, монитор могли разбудить курсором — такие уже не в списке
+                    List<Asleep> woke = _asleep.FindAll(x => awake.Contains(x.Key));
+                    foreach (Asleep a in woke) _asleep.Remove(a);
                     if (_asleep.Count == 0) _timer.Stop();
+                    foreach (Asleep a in woke)
+                        if (unchecked(Environment.TickCount - a.At) < VerifyMs) _app.OnSleepFailed(a.Key, a.Afk);
                     _app.OnSleepChanged();
                 });
             });
@@ -2684,6 +2692,13 @@ namespace MonitorTray
             s.At = Environment.TickCount;
             _sleepers.Add(s);
             _app.OnAfkChanged(m.Name, true);
+        }
+
+        // усыпили по DDC/CI, а монитор не уснул — отключить его, как мониторы без этой команды
+        public void SleepFailed(Mon m)
+        {
+            Screen sc = Array.Find(Screen.AllScreens, x => x.DeviceName == m.GdiName);
+            if (sc != null) Sleep(sc, IdleMs() >= Ui.AfkMinutes * 60000);
         }
 
         void Wake(Sleeper s, bool notify)
@@ -4082,6 +4097,15 @@ namespace MonitorTray
             if (Visible && !Busy && _drag == null) { Reload(); Render(); }
         }
 
+        // монитор отключился не из окна — раскладка экранов могла измениться
+        public void Relayout()
+        {
+            if (!Visible || Busy || _drag != null) return;
+            Reload();
+            AnchorAt(Cursor.Position);
+            Render();
+        }
+
         public void RepaintIfVisible()
         {
             if (Visible) Render();
@@ -4464,6 +4488,22 @@ namespace MonitorTray
         {
             UpdateTooltip();
             _popup.RefreshIfVisible();
+        }
+
+        // монитор принял команду сна, но не уснул: запомнить, что его можно только отключать,
+        // и отключить сейчас — со следующего раза он сразу выключается отключением
+        internal void OnSleepFailed(string key, bool afk)
+        {
+            Ui.SleepCaps[key] = false;
+            Ui.Save();
+            List<Mon> mons = Svc.List();
+            Mon m = mons.Find(x => x.Active && Ui.MonKey(x) == key);
+            if (m == null) return;
+            if (afk) { Afk.SleepFailed(m); return; }
+            if (mons.FindAll(x => x.Active && !Sleep.IsAsleep(x)).Count < 2) return; // последний включённый не гасим
+            if (Svc.Disable(m, false) != 0)
+                _icon.ShowBalloonTip(4000, Loc.Get("tray_title"), string.Format(Loc.Get("failed"), m.Name, Svc.LastError), ToolTipIcon.Error);
+            _popup.Relayout();
         }
 
         // у автообновления новости: нашлась версия, идёт загрузка, ошибка
